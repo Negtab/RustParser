@@ -97,7 +97,12 @@ func (g *AppGUI) handleOpenFile() {
 		if err != nil || reader == nil {
 			return
 		}
-		defer reader.Close()
+		defer func(reader fyne.URIReadCloser) {
+			err := reader.Close()
+			if err != nil {
+
+			}
+		}(reader)
 
 		g.lblFile.SetText("Анализ: " + reader.URI().Name())
 
@@ -113,9 +118,9 @@ func (g *AppGUI) handleOpenFile() {
 		g.lblN2.SetText(fmt.Sprintf("η2 (Словарь операндов): %.0f", metrics.N2))
 		g.lblTotalN1.SetText(fmt.Sprintf("N1 (Всего операторов): %.0f", metrics.TotalN1))
 		g.lblTotalN2.SetText(fmt.Sprintf("N2 (Всего операндов): %.0f", metrics.TotalN2))
-		g.lblVocab.SetText(fmt.Sprintf("η (Словарь программы): %.0f", metrics.Vocabulary))
-		g.lblLen.SetText(fmt.Sprintf("N (Длина программы): %.0f", metrics.Length))
-		g.lblVol.SetText(fmt.Sprintf("V (Объем программы): %.2f бит", metrics.Volume))
+		g.lblVocab.SetText(fmt.Sprintf("η (Словарь программы): %.0f + %.0f = %.0f", metrics.N1, metrics.N2, metrics.Vocabulary))
+		g.lblLen.SetText(fmt.Sprintf("N (Длина программы): %.0f + %.0f = %.0f", metrics.TotalN1, metrics.TotalN2, metrics.Length))
+		g.lblVol.SetText(fmt.Sprintf("V (Объем программы): %.0f * log2(%.0f) = %.0f бит", metrics.Length, metrics.Vocabulary, metrics.Volume))
 
 		// Перестраиваем списки операторов и операндов для таблиц
 		g.opRows = nil
