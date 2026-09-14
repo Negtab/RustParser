@@ -87,15 +87,34 @@ type rustLexer struct {
 	// как того требует определение операторов Холстеда: "...а также имена
 	// процедур и функций".
 	bracketStack []bracketFrame
+
+	// pendingDeclHeader: true в промежутке между ключевым словом
+	// struct/enum/union и её телом ("(" или "{") - нужно, чтобы пометить
+	// это тело как isDeclBody (там имена без вызова, а типы полей).
+	pendingDeclHeader bool
+
+	// pendingAnnot: активна между ключевым словом let/const/static/type
+	// и концом возможной аннотации типа - используется, чтобы найти
+	// двоеточие/"=" типа на той же глубине скобок, что и само ключевое
+	// слово (и не спутать его, например, с двоеточием внутри вложенного
+	// паттерна структуры глубже по стеку).
+	pendingAnnot pendingAnnotation
+}
+
+type pendingAnnotation struct {
+	active      bool
+	baseDepth   int
+	isTypeAlias bool // true для "type X = ..." - тип идёт и после "=" без двоеточия
 }
 
 type bracketFrame struct {
-	char     byte
-	callName string // непусто для вызова функции/метода ("(") или макроса ("(", "[" или "{")
+	char       byte
+	callName   string // непусто для вызова функции/метода ("(") или макроса ("(", "[" или "{")
+	isDeclBody bool   // тело struct/enum/union: двоеточия и имя+скобка внутри - объявления полей/вариантов, а не вызовы/литералы
 }
 
 func newRustLexer(src []byte) *rustLexer {
-	return &rustLexer{src: src, n: len(src)}
+	return &rustLexer{src: src, n: len(src), pendingAnnot: pendingAnnotation{baseDepth: -1}}
 }
 
 func (l *rustLexer) peek() byte {
@@ -127,6 +146,82 @@ func (l *rustLexer) skipSpacesLookahead() int {
 		break
 	}
 	return p
+}
+
+// typeStop описывает условие окончания типового выражения при его пропуске
+// функцией skipTypeExpr: набор одиночных символов и/или целых слов
+// ("where"), которые на "нулевой" (по отношению к точке входа) глубине
+// скобок сигнализируют конец типа.
+type typeStop struct {
+	chars []byte
+	words []string
+}
+
+func (l *rustLexer) matchesStop(s typeStop) bool {
+	if l.pos >= l.n {
+		return true
+	}
+	c := l.src[l.pos]
+	for _, sc := range s.chars {
+		if c == sc {
+			return true
+		}
+	}
+	for _, w := range s.words {
+		if hasPrefix(l.src[l.pos:], w) {
+			after := l.peekAt(len(w))
+			r, _ := utf8.DecodeRune([]byte{after})
+			if !isIdentContinue(r) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// skipTypeExpr продвигает l.pos через типовое выражение, НЕ порождая для
+// него токенов (ни операторов, ни операндов) - в соответствии с решением
+// не считать типы данных вовсе (аналог правила Холстеда для Паскаля,
+// где раздел объявлений исключается из подсчёта целиком).
+//
+// Останавливается на первом символе/слове из stop, встреченном на
+// "нулевой" глубине скобок относительно точки входа - вложенные (), [],
+// {} и <> внутри самого типа (Vec<HashMap<K, V>>, fn(i32) -> i32,
+// &'a [i32; 4] и т.п.) корректно увеличивают/уменьшают эту локальную
+// глубину, поэтому не путаются со стоп-символами. Строки/симв. литералы
+// и комментарии внутри типа (на практике - в const generics) тоже
+// корректно пропускаются, не сбивая подсчёт скобок.
+func (l *rustLexer) skipTypeExpr(stop typeStop) {
+	depth := 0
+	for l.pos < l.n {
+		if depth == 0 && l.matchesStop(stop) {
+			return
+		}
+		c := l.src[l.pos]
+		switch {
+		case c == '/' && l.peekAt(1) == '/':
+			l.skipLineComment()
+		case c == '/' && l.peekAt(1) == '*':
+			l.skipBlockComment()
+		case c == '"':
+			l.advanceOverStringBody()
+		case c == '\'':
+			l.lexQuote() // не нужен сам токен - только корректно продвинуть pos
+		case c == '(' || c == '{' || c == '[' || c == '<':
+			depth++
+			l.pos++
+		case c == ')' || c == '}' || c == ']' || c == '>':
+			if depth == 0 {
+				// Несбалансированная скобка на нулевой глубине - выходим,
+				// чтобы не застрять и не увести позицию не туда.
+				return
+			}
+			depth--
+			l.pos++
+		default:
+			l.pos++
+		}
+	}
 }
 
 // Lex разбирает весь исходный код и возвращает последовательность токенов.
@@ -196,7 +291,16 @@ func (l *rustLexer) Lex() []token {
 		// lexIdentOrMacro): запоминаем в стеке, токен не выдаём - он
 		// будет выдан один раз при встрече закрывающей пары.
 		if c == '(' || c == '{' || c == '[' {
-			l.bracketStack = append(l.bracketStack, bracketFrame{char: c})
+			declish := false
+			if c == '{' {
+				if l.pendingDeclHeader {
+					declish = true
+					l.pendingDeclHeader = false
+				} else if n := len(l.bracketStack); n > 0 && l.bracketStack[n-1].isDeclBody {
+					declish = true
+				}
+			}
+			l.bracketStack = append(l.bracketStack, bracketFrame{char: c, isDeclBody: declish})
 			l.pos++
 			continue
 		}
@@ -222,7 +326,64 @@ func (l *rustLexer) Lex() []token {
 			continue
 		}
 
-		tokens = append(tokens, l.lexPunct())
+		// Двоеточие как маркер начала типа: не считаем ни само двоеточие,
+		// ни то, что после него, если это (а) аннотация let/const/static/
+		// type на той же глубине скобок, что и само ключевое слово,
+		// (б) тип параметра прямо внутри списка параметров вызова/функции,
+		// или (в) тип поля прямо в теле struct/enum. Двоеточие после
+		// лайфтайма ('label: loop {...}) - это метка цикла, а не тип,
+		// поэтому исключаем этот случай отдельно.
+		if c == ':' && l.peekAt(1) != ':' {
+			depth := len(l.bracketStack)
+			lastIsLifetimeLabel := len(tokens) > 0 && strings.HasPrefix(tokens[len(tokens)-1].Text, "'")
+			isParamColon := depth > 0 && l.bracketStack[depth-1].char == '(' && l.bracketStack[depth-1].callName != ""
+			isFieldColon := depth > 0 && l.bracketStack[depth-1].char == '{' && l.bracketStack[depth-1].isDeclBody
+			isAnnotColon := l.pendingAnnot.active && l.pendingAnnot.baseDepth == depth
+			if !lastIsLifetimeLabel && (isParamColon || isFieldColon || isAnnotColon) {
+				l.pendingAnnot.active = false
+				l.pos++ // пропускаем ':', не выдаём токен
+				var stop typeStop
+				switch {
+				case isParamColon:
+					stop = typeStop{chars: []byte{',', ')'}}
+				case isFieldColon:
+					stop = typeStop{chars: []byte{',', '}'}}
+				default:
+					stop = typeStop{chars: []byte{'=', ';'}}
+				}
+				l.skipTypeExpr(stop)
+				continue
+			}
+		}
+
+		tok := l.lexPunct()
+		switch tok.Text {
+		case ";":
+			tokens = append(tokens, tok)
+			l.pendingDeclHeader = false
+			if l.pendingAnnot.active && l.pendingAnnot.baseDepth == len(l.bracketStack) {
+				l.pendingAnnot.active = false
+			}
+		case "=":
+			tokens = append(tokens, tok)
+			if l.pendingAnnot.active && l.pendingAnnot.baseDepth == len(l.bracketStack) {
+				wasTypeAlias := l.pendingAnnot.isTypeAlias
+				l.pendingAnnot.active = false
+				if wasTypeAlias {
+					// "type Name = Type;" - двоеточия нет, весь тип идёт
+					// сразу после "=" и до ";".
+					l.skipTypeExpr(typeStop{chars: []byte{';'}})
+				}
+			}
+		case "->":
+			// Возвращаемый тип функции/замыкания/трейт-баунда: сама стрелка -
+			// такой же маркер типа, как и ":", поэтому тоже не считается;
+			// пропускаем весь тип до тела "{", ";" (сигнатура без тела,
+			// напр. в trait) или "where".
+			l.skipTypeExpr(typeStop{chars: []byte{'{', ';'}, words: []string{"where"}})
+		default:
+			tokens = append(tokens, tok)
+		}
 	}
 
 	return tokens
@@ -533,6 +694,17 @@ func (l *rustLexer) lexIdentOrMacro() (token, bool) {
 		// Ключевые слова (if, while, match...) сами по себе операторы;
 		// круглая скобка после них (например "if (x)") - обычная
 		// группирующая скобка, а не вызов, поэтому имя с ней не сливаем.
+		switch text {
+		case "struct", "enum", "union":
+			// От этого места и до "(" / "{" тела (или ";" для unit-struct) -
+			// заголовок объявления типа: следующее тело нужно пометить как
+			// isDeclBody (поля/варианты, а не вызовы/литералы/код).
+			l.pendingDeclHeader = true
+		case "let", "const", "static":
+			l.pendingAnnot = pendingAnnotation{active: true, baseDepth: len(l.bracketStack)}
+		case "type":
+			l.pendingAnnot = pendingAnnotation{active: true, baseDepth: len(l.bracketStack), isTypeAlias: true}
+		}
 		return token{Text: text, Operand: false}, true
 	}
 
@@ -541,7 +713,23 @@ func (l *rustLexer) lexIdentOrMacro() (token, bool) {
 	// методов (obj.method()) и конструкторы tuple-структур Foo(...).
 	if p := l.skipSpacesLookahead(); p < l.n && l.src[p] == '(' {
 		l.pos = p + 1 // поглощаем пробелы и открывающую скобку
-		l.bracketStack = append(l.bracketStack, bracketFrame{char: '(', callName: text})
+
+		// Если это заголовок struct/enum/union (tuple-struct или
+		// tuple-вариант перечисления) или мы уже внутри тела struct/enum
+		// (isDeclBody) - вся эта "(...)" является списком ТИПОВ полей,
+		// а не аргументов вызова: сама пара имя+скобки остаётся одним
+		// оператором ("Foo()"), а типы внутри не считаются вовсе.
+		declish := l.pendingDeclHeader
+		if !declish {
+			if n := len(l.bracketStack); n > 0 && l.bracketStack[n-1].isDeclBody {
+				declish = true
+			}
+		}
+		l.bracketStack = append(l.bracketStack, bracketFrame{char: '(', callName: text, isDeclBody: declish})
+		if declish {
+			l.pendingDeclHeader = false
+			l.skipTypeExpr(typeStop{chars: []byte{')'}})
+		}
 		return token{}, false
 	}
 
