@@ -8,7 +8,6 @@ import (
 	"unicode/utf8"
 )
 
-// StructuralMetrics хранит сырые данные и итоговые расчеты метрик Холстеда.
 type StructuralMetrics struct {
 	Operators map[string]int
 	Operands  map[string]int
@@ -24,7 +23,6 @@ type StructuralMetrics struct {
 }
 
 // AnalyzeRustFile принимает путь к файлу, лексирует его собственным лексером
-// (без tree-sitter) и возвращает заполненную структуру метрик.
 func AnalyzeRustFile(filePath string) (*StructuralMetrics, error) {
 	sourceCode, err := os.ReadFile(filePath)
 	if err != nil {
@@ -63,15 +61,9 @@ func AnalyzeRustFile(filePath string) (*StructuralMetrics, error) {
 	return res, nil
 }
 
-// ---------------------------------------------------------------------------
-// Ручной лексер Rust для подсчета операторов/операндов Холстеда.
-// Работает на уровне символов, а не AST, поэтому не зависит от того, как
-// конкретная грамматика сворачивает парные токены вроде "{}" или "()".
-// ---------------------------------------------------------------------------
-
 type token struct {
 	Text    string
-	Operand bool // true = операнд (идентификатор, литерал), false = оператор
+	Operand bool // true = операнд, false = оператор
 }
 
 type rustLexer struct {
@@ -691,9 +683,9 @@ func (l *rustLexer) lexIdentOrMacro() (token, bool) {
 		return token{Text: text, Operand: true}, true
 	}
 	if rustKeywords[text] {
-		// Ключевые слова (if, while, match...) сами по себе операторы;
-		// круглая скобка после них (например "if (x)") - обычная
-		// группирующая скобка, а не вызов, поэтому имя с ней не сливаем.
+		if text == "else" {
+			return token{}, false
+		}
 		switch text {
 		case "struct", "enum", "union":
 			// От этого места и до "(" / "{" тела (или ";" для unit-struct) -

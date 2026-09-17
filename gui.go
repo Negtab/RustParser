@@ -51,7 +51,6 @@ func (g *AppGUI) initUI() {
 	g.lblLen = widget.NewLabel("N (Длина программы): -")
 	g.lblVol = widget.NewLabel("V (Объем программы): -")
 
-	// Инициализация списков-таблиц
 	g.listOperators = widget.NewList(
 		func() int { return len(g.opRows) },
 		func() fyne.CanvasObject { return widget.NewLabel("") },
@@ -72,10 +71,8 @@ func (g *AppGUI) initUI() {
 		},
 	)
 
-	// Кнопка выбора файла
 	btnOpen := widget.NewButton("Открыть Rust файл", g.handleOpenFile)
 
-	// Компоновка окон (Layout)
 	topContainer := container.NewVBox(btnOpen, g.lblFile)
 	metricsContainer := container.NewVBox(
 		widget.NewLabelWithStyle("Итоговые результаты:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
@@ -106,14 +103,12 @@ func (g *AppGUI) handleOpenFile() {
 
 		g.lblFile.SetText("Анализ: " + reader.URI().Name())
 
-		// Вызываем бизнес-логику из analyzer.go
 		metrics, err := AnalyzeRustFile(reader.URI().Path())
 		if err != nil {
 			dialog.ShowError(err, g.window)
 			return
 		}
 
-		// Обновляем текстовые поля интерфейса данными из структуры
 		g.lblN1.SetText(fmt.Sprintf("η1 (Словарь операторов): %.0f", metrics.N1))
 		g.lblN2.SetText(fmt.Sprintf("η2 (Словарь операндов): %.0f", metrics.N2))
 		g.lblTotalN1.SetText(fmt.Sprintf("N1 (Всего операторов): %.0f", metrics.TotalN1))
@@ -122,7 +117,6 @@ func (g *AppGUI) handleOpenFile() {
 		g.lblLen.SetText(fmt.Sprintf("N (Длина программы): %.0f + %.0f = %.0f", metrics.TotalN1, metrics.TotalN2, metrics.Length))
 		g.lblVol.SetText(fmt.Sprintf("V (Объем программы): %.0f * log2(%.0f) = %.0f бит", metrics.Length, metrics.Vocabulary, metrics.Volume))
 
-		// Перестраиваем списки операторов и операндов для таблиц
 		g.opRows = nil
 		for k, v := range metrics.Operators {
 			g.opRows = append(g.opRows, TableRow{Key: k, Count: fmt.Sprintf("%d", v)})
@@ -135,7 +129,6 @@ func (g *AppGUI) handleOpenFile() {
 		}
 		sort.Slice(g.valRows, func(i, j int) bool { return g.valRows[i].Key < g.valRows[j].Key })
 
-		// Обновляем списки на экране
 		g.listOperators.Refresh()
 		g.listOperands.Refresh()
 
