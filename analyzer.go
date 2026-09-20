@@ -97,6 +97,11 @@ type rustLexer struct {
 	// extra: токены, найденные внутри пропущенных дженериков (for<>).
 	extra []token
 
+	// rootPure: то же, что bracketFrame.pure, но для уровня вне скобок.
+	rootPure bool
+	// seen: сколько токенов из результата уже учтено в notePure.
+	seen int
+
 	// pendingAnnot: активна между ключевым словом let/const/static/type
 	// и концом возможной аннотации типа - используется, чтобы найти
 	// двоеточие/"=" типа на той же глубине скобок, что и само ключевое
@@ -115,10 +120,18 @@ type bracketFrame struct {
 	char       byte
 	callName   string // непусто для вызова функции/метода ("(") или макроса ("(", "[" или "{")
 	isDeclBody bool   // тело struct/enum/union: двоеточия и имя+скобка внутри - объявления полей/вариантов, а не вызовы/литералы
+	pure       bool   // с начала инструкции на этом уровне были только части цепочки (a.b::c())
+	stmtLevel  bool   // вызов стоит в начале инструкции
+	isDecl     bool   // объявление fn/struct/enum-варианта, а не вызов
 }
 
 func newRustLexer(src []byte) *rustLexer {
-	return &rustLexer{src: src, n: len(src), pendingAnnot: pendingAnnotation{baseDepth: -1}}
+	return &rustLexer{
+		src:          src,
+		n:            len(src),
+		rootPure:     true,
+		pendingAnnot: pendingAnnotation{baseDepth: -1},
+	}
 }
 
 func (l *rustLexer) peek() byte {
@@ -150,6 +163,41 @@ func (l *rustLexer) skipSpacesLookahead() int {
 		break
 	}
 	return p
+}
+
+// curPure возвращает признак "инструкция пока состоит только из цепочки"
+// для текущего уровня скобок.
+func (l *rustLexer) curPure() bool {
+	if n := len(l.bracketStack); n > 0 {
+		return l.bracketStack[n-1].pure
+	}
+	return l.rootPure
+}
+
+func (l *rustLexer) setPure(v bool) {
+	if n := len(l.bracketStack); n > 0 {
+		l.bracketStack[n-1].pure = v
+	} else {
+		l.rootPure = v
+	}
+}
+
+// notePure обновляет признак "инструкция ещё состоит только из цепочки".
+func (l *rustLexer) notePure(t token) {
+	switch {
+	case t.Text == ";" || strings.HasSuffix(t.Text, "{}"):
+		l.setPure(true) // конец инструкции или блока
+	case t.Operand, t.Text == ".", t.Text == "::", t.Text == "?",
+		strings.HasSuffix(t.Text, "()"), strings.HasSuffix(t.Text, "[]"):
+		// цепочка продолжается
+	default:
+		l.setPure(false) // let, =, +, return, => и т.д.
+	}
+}
+
+// isPatternEnd: после ")" идёт "=>" или одиночное "=" - это паттерн, а не вызов.
+func (l *rustLexer) isPatternEnd(p int) bool {
+	return p+1 < l.n && l.src[p] == '=' && l.src[p+1] != '='
 }
 
 // typeStop описывает условие окончания типового выражения при его пропуске
@@ -298,6 +346,15 @@ func (l *rustLexer) Lex() []token {
 	var tokens []token
 
 	for l.pos < l.n {
+		// Обновляем признак "чистой цепочки" по токенам, добавленным
+		// на предыдущих шагах.
+		if len(tokens) > l.seen {
+			for _, t := range tokens[l.seen:] {
+				l.notePure(t)
+			}
+			l.seen = len(tokens)
+		}
+
 		c := l.peek()
 
 		// Пробелы
@@ -373,21 +430,29 @@ func (l *rustLexer) Lex() []token {
 					declish = true
 				}
 			}
-			l.bracketStack = append(l.bracketStack, bracketFrame{char: c, isDeclBody: declish})
+			l.bracketStack = append(l.bracketStack, bracketFrame{char: c, isDeclBody: declish, pure: c == '{'})
 			l.pos++
 			continue
 		}
 		// Закрывающая скобка: пара (открывающая+закрывающая) считается
 		// одним терминалом-оператором, например "()", "{}" или "[]".
 		// Если открывающая была частью вызова (callName != ""), выдаём
-		// единый оператор "имя()" вместо generic "()".
+		// единый оператор "имя()" вместо generic "()". Вызов в составе
+		// выражения даёт ещё и операнд (возвращаемое значение).
 		if c == ')' || c == '}' || c == ']' {
 			l.pos++
 			if n := len(l.bracketStack); n > 0 {
 				frame := l.bracketStack[n-1]
 				l.bracketStack = l.bracketStack[:n-1]
 				if frame.callName != "" {
-					tokens = append(tokens, token{Text: frame.callName + bracketPairText(frame.char), Operand: false})
+					opText := frame.callName + bracketPairText(frame.char)
+					tokens = append(tokens, token{Text: opText, Operand: false})
+
+					p := l.skipSpacesLookahead()
+					stmtEnd := frame.stmtLevel && p < l.n && l.src[p] == ';'
+					if !frame.isDecl && !stmtEnd && !l.isPatternEnd(p) {
+						tokens = append(tokens, token{Text: opText, Operand: true})
+					}
 				} else {
 					tokens = append(tokens, token{Text: bracketPairText(frame.char), Operand: false})
 				}
@@ -752,7 +817,12 @@ func (l *rustLexer) lexIdentOrMacro() (token, bool) {
 			case '(', '[', '{':
 				open := l.src[p]
 				l.pos = p + 1
-				l.bracketStack = append(l.bracketStack, bracketFrame{char: open, callName: macroName})
+				l.bracketStack = append(l.bracketStack, bracketFrame{
+					char:      open,
+					callName:  macroName,
+					pure:      open == '{',
+					stmtLevel: l.curPure(),
+				})
 				return token{}, false
 			}
 		}
@@ -807,11 +877,14 @@ func (l *rustLexer) lexIdentOrMacro() (token, bool) {
 
 	// Имя после fn/struct/enum/union/trait/type: пропускаем <...>,
 	// дальше идентификатор идёт по обычному пути (проверка на "(").
+	wasName := l.pendingName // это имя объявляемой сущности (fn/struct/...)
+	name := text
 	if l.pendingName {
 		l.pendingName = false
 		if p := l.skipSpacesLookahead(); p < l.n && l.src[p] == '<' {
 			l.pos = p
 			l.skipGenerics()
+			// name = text + "<>" // раскомментируй, если нужно отличать generic-объявления
 		}
 	}
 
@@ -832,7 +905,13 @@ func (l *rustLexer) lexIdentOrMacro() (token, bool) {
 				declish = true
 			}
 		}
-		l.bracketStack = append(l.bracketStack, bracketFrame{char: '(', callName: text, isDeclBody: declish})
+		l.bracketStack = append(l.bracketStack, bracketFrame{
+			char:       '(',
+			callName:   name,
+			isDeclBody: declish,
+			stmtLevel:  l.curPure(),
+			isDecl:     wasName || declish,
+		})
 		if declish {
 			l.pendingDeclHeader = false
 			l.skipTypeExpr(typeStop{chars: []byte{')'}})
@@ -840,7 +919,7 @@ func (l *rustLexer) lexIdentOrMacro() (token, bool) {
 		return token{}, false
 	}
 
-	return token{Text: text, Operand: true}, true
+	return token{Text: name, Operand: true}, true
 }
 
 var threeCharOps = []string{"<<=", ">>=", "..=", "..."}
