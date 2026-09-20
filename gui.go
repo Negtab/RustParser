@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"sort"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -31,6 +33,7 @@ type AppGUI struct {
 	valRows       []TableRow
 	listOperators *widget.List
 	listOperands  *widget.List
+	lblSource     *widget.Label
 }
 
 func NewAppGUI(w fyne.Window) *AppGUI {
@@ -71,6 +74,16 @@ func (g *AppGUI) initUI() {
 		},
 	)
 
+	g.lblSource = widget.NewLabel("")
+	g.lblSource.TextStyle = fyne.TextStyle{Monospace: true}
+	sourceScroll := container.NewScroll(g.lblSource)
+
+	sourcePanel := container.NewBorder(
+		widget.NewLabelWithStyle("Исходный код", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+		nil, nil, nil,
+		sourceScroll,
+	)
+
 	btnOpen := widget.NewButton("Открыть Rust файл", g.handleOpenFile)
 
 	topContainer := container.NewVBox(btnOpen, g.lblFile)
@@ -80,12 +93,16 @@ func (g *AppGUI) initUI() {
 		widget.NewSeparator(),
 		g.lblVocab, g.lblLen, g.lblVol,
 	)
+
 	tablesContainer := container.NewGridWithColumns(2,
 		container.NewBorder(widget.NewLabelWithStyle("Операторы", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}), nil, nil, nil, g.listOperators),
 		container.NewBorder(widget.NewLabelWithStyle("Операнды", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}), nil, nil, nil, g.listOperands),
 	)
 
-	mainLayout := container.NewBorder(topContainer, nil, metricsContainer, nil, tablesContainer)
+	split := container.NewHSplit(sourcePanel, tablesContainer)
+	split.Offset = 0.4
+
+	mainLayout := container.NewBorder(topContainer, nil, metricsContainer, nil, split)
 	g.window.SetContent(mainLayout)
 }
 
@@ -102,6 +119,13 @@ func (g *AppGUI) handleOpenFile() {
 		}(reader)
 
 		g.lblFile.SetText("Анализ: " + reader.URI().Name())
+
+		data, err := io.ReadAll(reader)
+		if err != nil {
+			dialog.ShowError(err, g.window)
+			return
+		}
+		g.lblSource.SetText(strings.ReplaceAll(string(data), "\r\n", "\n"))
 
 		metrics, err := AnalyzeRustFile(reader.URI().Path())
 		if err != nil {

@@ -85,6 +85,18 @@ type rustLexer struct {
 	// это тело как isDeclBody (там имена без вызова, а типы полей).
 	pendingDeclHeader bool
 
+	// pendingImpl: true между ключевым словом impl и телом "{" (или ";").
+	// Если в этом промежутке встретится "for" - это "impl Trait for Type",
+	// а не цикл.
+	pendingImpl bool
+
+	// pendingName: следующий идентификатор - имя объявляемой сущности
+	// (fn/struct/enum/union/trait/type); после него может идти <...>.
+	pendingName bool
+
+	// extra: токены, найденные внутри пропущенных дженериков (for<>).
+	extra []token
+
 	// pendingAnnot: активна между ключевым словом let/const/static/type
 	// и концом возможной аннотации типа - используется, чтобы найти
 	// двоеточие/"=" типа на той же глубине скобок, что и само ключевое
@@ -216,6 +228,71 @@ func (l *rustLexer) skipTypeExpr(stop typeStop) {
 	}
 }
 
+// atHRTB: на текущей позиции стоит слово "for", за которым (после пробелов) идёт "<".
+func (l *rustLexer) atHRTB() bool {
+	if !hasPrefix(l.src[l.pos:], "for") {
+		return false
+	}
+	if l.pos > 0 {
+		if b := l.src[l.pos-1]; isIdentStartByte(b) || isDigit(b) {
+			return false // "for" - часть другого идентификатора
+		}
+	}
+	save := l.pos
+	l.pos += 3
+	p := l.skipSpacesLookahead()
+	l.pos = save
+	return p < l.n && l.src[p] == '<'
+}
+
+// skipGenerics пропускает блок <...>, начиная с '<'. Ничего не считает,
+// кроме HRTB: каждый for<...> внутри превращается в токен "for<>".
+// "->" внутри (F: Fn() -> i32) не считается закрывающей скобкой.
+func (l *rustLexer) skipGenerics() {
+	depth := 0
+	for l.pos < l.n {
+		c := l.src[l.pos]
+		switch {
+		case c == '-' && l.peekAt(1) == '>':
+			l.pos += 2
+		case c == '/' && l.peekAt(1) == '/':
+			l.skipLineComment()
+		case c == '/' && l.peekAt(1) == '*':
+			l.skipBlockComment()
+		case c == '"':
+			l.advanceOverStringBody()
+		case c == '\'':
+			l.lexQuote()
+		case c == 'f' && l.atHRTB():
+			l.extra = append(l.extra, token{Text: "for<>", Operand: false})
+			l.pos += 3
+			l.pos = l.skipSpacesLookahead()
+			l.skipGenerics() // пропускаем <'a, ...> рекурсивно
+		case c == '<':
+			depth++
+			l.pos++
+		case c == '>':
+			depth--
+			l.pos++
+			if depth == 0 {
+				return
+			}
+		default:
+			l.pos++
+		}
+	}
+}
+
+// expectName помечает, что следующий идентификатор - имя объявляемой сущности.
+func (l *rustLexer) expectName() {
+	p := l.skipSpacesLookahead()
+	if p < l.n {
+		if r, _ := utf8.DecodeRune(l.src[p:]); isIdentStart(r) {
+			l.pendingName = true
+		}
+	}
+}
+
 // Lex разбирает весь исходный код и возвращает последовательность токенов.
 func (l *rustLexer) Lex() []token {
 	var tokens []token
@@ -273,7 +350,10 @@ func (l *rustLexer) Lex() []token {
 			continue
 		}
 		if r, _ := utf8.DecodeRune(l.src[l.pos:]); isIdentStart(r) {
-			if tok, emit := l.lexIdentOrMacro(); emit {
+			tok, emit := l.lexIdentOrMacro()
+			tokens = append(tokens, l.extra...)
+			l.extra = l.extra[:0]
+			if emit {
 				tokens = append(tokens, tok)
 			}
 			continue
@@ -285,6 +365,7 @@ func (l *rustLexer) Lex() []token {
 		if c == '(' || c == '{' || c == '[' {
 			declish := false
 			if c == '{' {
+				l.pendingImpl = false // заголовок impl закончился
 				if l.pendingDeclHeader {
 					declish = true
 					l.pendingDeclHeader = false
@@ -353,6 +434,7 @@ func (l *rustLexer) Lex() []token {
 		case ";":
 			tokens = append(tokens, tok)
 			l.pendingDeclHeader = false
+			l.pendingImpl = false
 			if l.pendingAnnot.active && l.pendingAnnot.baseDepth == len(l.bracketStack) {
 				l.pendingAnnot.active = false
 			}
@@ -687,17 +769,50 @@ func (l *rustLexer) lexIdentOrMacro() (token, bool) {
 			return token{}, false
 		}
 		switch text {
+		case "impl":
+			l.pendingImpl = true
+			// impl<T: ...> - пропускаем дженерики сразу после impl
+			if p := l.skipSpacesLookahead(); p < l.n && l.src[p] == '<' {
+				l.pos = p
+				l.skipGenerics()
+			}
+		case "for":
+			// HRTB: for<'a> - один оператор "for<>"
+			if p := l.skipSpacesLookahead(); p < l.n && l.src[p] == '<' {
+				l.pos = p
+				l.skipGenerics()
+				return token{Text: "for<>", Operand: false}, true
+			}
+			// impl Trait for Type
+			if l.pendingImpl {
+				l.pendingImpl = false
+				return token{Text: "impl-for", Operand: false}, true
+			}
+		case "fn", "trait":
+			l.expectName()
 		case "struct", "enum", "union":
 			// От этого места и до "(" / "{" тела (или ";" для unit-struct) -
 			// заголовок объявления типа: следующее тело нужно пометить как
 			// isDeclBody (поля/варианты, а не вызовы/литералы/код).
 			l.pendingDeclHeader = true
+			l.expectName()
 		case "let", "const", "static":
 			l.pendingAnnot = pendingAnnotation{active: true, baseDepth: len(l.bracketStack)}
 		case "type":
 			l.pendingAnnot = pendingAnnotation{active: true, baseDepth: len(l.bracketStack), isTypeAlias: true}
+			l.expectName()
 		}
 		return token{Text: text, Operand: false}, true
+	}
+
+	// Имя после fn/struct/enum/union/trait/type: пропускаем <...>,
+	// дальше идентификатор идёт по обычному пути (проверка на "(").
+	if l.pendingName {
+		l.pendingName = false
+		if p := l.skipSpacesLookahead(); p < l.n && l.src[p] == '<' {
+			l.pos = p
+			l.skipGenerics()
+		}
 	}
 
 	// Обычный идентификатор: смотрим вперёд (пропуская только пробелы) -
