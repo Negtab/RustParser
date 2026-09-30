@@ -31,7 +31,8 @@ type StructuralMetrics struct {
 type GilbMetrics struct {
 	Absolute   int     // AC: число циклов, ветвлений и вариантов match
 	Relative   float64 // OC: AC / TotalN1 (общее число операторов Холстеда)
-	MaxNesting int     // максимальный уровень вложенности управляющих конструкций
+	Count      int
+	MaxNesting int // максимальный уровень вложенности управляющих конструкций
 }
 
 func AnalyzeRustFile(filePath string) (*StructuralMetrics, error) {
@@ -77,6 +78,7 @@ func AnalyzeRustFile(filePath string) (*StructuralMetrics, error) {
 		}
 	}
 	if refOps > 0 {
+		res.Gilb.Count = refOps + res.Gilb.Absolute
 		res.Gilb.Relative = float64(res.Gilb.Absolute) / (float64(refOps) + float64(res.Gilb.Absolute))
 	}
 

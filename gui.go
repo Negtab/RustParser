@@ -39,9 +39,10 @@ type AppGUI struct {
 	listOperands  *widget.List
 
 	// Метрики Джилба
-	lblGilbAbs  *widget.Label
-	lblGilbRel  *widget.Label
-	lblGilbNest *widget.Label
+	lblGilbAbs   *widget.Label
+	lblGilbRel   *widget.Label
+	lblGilbCount *widget.Label
+	lblGilbNest  *widget.Label
 
 	// metricsArea переключается между placeholder/halsteadView/gilbView -
 	// одновременно показывается только один из наборов метрик.
@@ -145,11 +146,12 @@ func (g *AppGUI) buildHalsteadView() {
 func (g *AppGUI) buildGilbView() {
 	g.lblGilbAbs = widget.NewLabel("AC (Абсолютная сложность): -")
 	g.lblGilbRel = widget.NewLabel("OC (Относительная сложность): -")
+	g.lblGilbCount = widget.NewLabel("Количество операторов: -")
 	g.lblGilbNest = widget.NewLabel("Максимальный уровень вложенности: -")
 
 	g.gilbView = container.NewVBox(
 		widget.NewLabelWithStyle("Метрики Джилба:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		g.lblGilbAbs, g.lblGilbRel, g.lblGilbNest,
+		g.lblGilbAbs, g.lblGilbRel, g.lblGilbCount, g.lblGilbNest,
 	)
 }
 
@@ -255,6 +257,7 @@ func (g *AppGUI) handleComputeGilb() {
 	m := metrics.Gilb
 	g.lblGilbAbs.SetText(fmt.Sprintf("AC (Абсолютная сложность): %d", m.Absolute))
 	g.lblGilbRel.SetText(fmt.Sprintf("OC (Относительная сложность): %.3f", m.Relative))
+	g.lblGilbCount.SetText(fmt.Sprintf("Количество операторов: %d", m.Count))
 	g.lblGilbNest.SetText(fmt.Sprintf("Максимальный уровень вложенности: %d", m.MaxNesting))
 
 	g.showView(g.gilbView)
