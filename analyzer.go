@@ -77,7 +77,7 @@ func AnalyzeRustFile(filePath string) (*StructuralMetrics, error) {
 		}
 	}
 	if refOps > 0 {
-		res.Gilb.Relative = float64(res.Gilb.Absolute) / float64(refOps)
+		res.Gilb.Relative = float64(res.Gilb.Absolute) / (float64(refOps) + float64(res.Gilb.Absolute))
 	}
 
 	return res, nil
