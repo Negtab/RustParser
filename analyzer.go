@@ -13,17 +13,27 @@ type StructuralMetrics struct {
 	Operators map[string]int
 	Operands  map[string]int
 
-	N1      float64 // Словарь операторов (уникальные)
-	N2      float64 // Словарь операндов (уникальные)
-	TotalN1 float64 // Общее число операторов
-	TotalN2 float64 // Общее число операндов
+	N1      float64
+	N2      float64
+	TotalN1 float64
+	TotalN2 float64
 
-	Vocabulary float64 // Словарь программы (n)
-	Length     float64 // Длина программы (N)
-	Volume     float64 // Объем программы (V)
+	Vocabulary float64
+	Length     float64
+	Volume     float64
+
+	Gilb GilbMetrics
 }
 
-// AnalyzeRustFile принимает путь к файлу, лексирует его собственным лексером
+// GilbMetrics - метрики Джилба: сложность программы через число управляющих
+// конструкций (циклов и ветвлений, включая многовариантный выбор match)
+// и глубину их вложенности.
+type GilbMetrics struct {
+	Absolute   int     // AC: число циклов, ветвлений и вариантов match
+	Relative   float64 // OC: AC / TotalN1 (общее число операторов Холстеда)
+	MaxNesting int     // максимальный уровень вложенности управляющих конструкций
+}
+
 func AnalyzeRustFile(filePath string) (*StructuralMetrics, error) {
 	sourceCode, err := os.ReadFile(filePath)
 	if err != nil {
@@ -59,12 +69,26 @@ func AnalyzeRustFile(filePath string) (*StructuralMetrics, error) {
 		res.Volume = res.Length * math.Log2(res.Vocabulary)
 	}
 
+	res.Gilb = lexer.gilb
+	if res.TotalN1 > 0 {
+		res.Gilb.Relative = float64(res.Gilb.Absolute) / res.TotalN1
+	}
+
 	return res, nil
 }
 
 type token struct {
 	Text    string
-	Operand bool // true = операнд, false = оператор
+	Operand bool
+}
+
+// controlPending - управляющая конструкция (if/while/for/loop/match),
+// заголовок которой уже разобран, а тело "{" ещё не встречено.
+// depth - глубина стека скобок в момент ключевого слова: тело этой
+// конструкции откроется на той же глубине.
+type controlPending struct {
+	depth int
+	kind  byte // 'o' - if/while/for/loop, 'm' - match
 }
 
 type rustLexer struct {
@@ -72,62 +96,48 @@ type rustLexer struct {
 	pos int
 	n   int
 
-	// bracketStack хранит открывающие скобки (, {, [ для сопоставления
-	// с закрывающими: пара скобок считается ОДНИМ терминалом-оператором.
-	// Если открывающая "(" стоит сразу после имени функции/метода/макроса
-	// (вызов), callName хранит это имя - тогда вся пара "имя(...)"
-	// схлопывается в один оператор "имя()" вместо отдельного generic "()",
-	// как того требует определение операторов Холстеда: "...а также имена
-	// процедур и функций".
-	bracketStack []bracketFrame
+	bracketStack []bracketFrame // для открывающих скобок
 
-	// pendingDeclHeader: true в промежутке между ключевым словом
-	// struct/enum/union и её телом ("(" или "{") - нужно, чтобы пометить
-	// это тело как isDeclBody (там имена без вызова, а типы полей).
 	pendingDeclHeader bool
+	pendingImpl       bool
+	pendingName       bool
 
-	// pendingImpl: true между ключевым словом impl и телом "{" (или ";").
-	// Если в этом промежутке встретится "for" - это "impl Trait for Type",
-	// а не цикл.
-	pendingImpl bool
-
-	// pendingName: следующий идентификатор - имя объявляемой сущности
-	// (fn/struct/enum/union/trait/type); после него может идти <...>.
-	pendingName bool
-
-	// extra: токены, найденные внутри пропущенных дженериков (for<>).
 	extra []token
 
-	// rootPure: то же, что bracketFrame.pure, но для уровня вне скобок.
 	rootPure bool
-	// seen: сколько токенов из результата уже учтено в notePure.
-	seen int
+	seen     int
 
-	// headerDepth: глубина скобок, на которой открыт заголовок if/while/match/
-	// for/impl/trait/where. Пока он открыт, "Имя {" - это начало блока.
-	headerDepth int
-
-	// pendingAnnot: активна между ключевым словом let/const/static/type
-	// и концом возможной аннотации типа - используется, чтобы найти
-	// двоеточие/"=" типа на той же глубине скобок, что и само ключевое
-	// слово (и не спутать его, например, с двоеточием внутри вложенного
-	// паттерна структуры глубже по стеку).
+	headerDepth  int
 	pendingAnnot pendingAnnotation
+
+	// pendingControls: управляющие конструкции, ждущие своего тела "{".
+	pendingControls []controlPending
+	// matchBodyDepths: глубины, на которых лежат ветви открытых match
+	// (по одной на каждый вложенный match).
+	matchBodyDepths []int
+	// currentNesting: текущая вложенность управляющих конструкций.
+	currentNesting int
+	gilb           GilbMetrics
 }
 
 type pendingAnnotation struct {
 	active      bool
 	baseDepth   int
-	isTypeAlias bool // true для "type X = ..." - тип идёт и после "=" без двоеточия
+	isTypeAlias bool
 }
 
 type bracketFrame struct {
 	char       byte
-	callName   string // непусто для вызова функции/метода ("(") или макроса ("(", "[" или "{"), а также для "Имя {"
-	isDeclBody bool   // тело struct/enum/union: двоеточия и имя+скобка внутри - объявления полей/вариантов, а не вызовы/литералы
-	pure       bool   // с начала инструкции на этом уровне были только части цепочки (a.b::c())
-	stmtLevel  bool   // вызов стоит в начале инструкции
-	isDecl     bool   // объявление fn/struct/enum-варианта, а не вызов
+	callName   string
+	isDeclBody bool
+	pure       bool
+	stmtLevel  bool
+	isDecl     bool
+
+	// isControlBody: эта "{" - тело if/while/for/loop/match (не функции,
+	// не impl, не литерала). controlKind хранит, какого именно вида.
+	isControlBody bool
+	controlKind   byte
 }
 
 func newRustLexer(src []byte) *rustLexer {
@@ -154,10 +164,6 @@ func (l *rustLexer) peekAt(off int) byte {
 	return l.src[l.pos+off]
 }
 
-// skipSpacesLookahead возвращает позицию первого не-пробельного байта начиная
-// с текущей, не изменяя l.pos. Используется, чтобы проверить "не идёт ли
-// дальше открывающая скобка вызова" перед тем, как решить - потреблять
-// пробелы или оставить их основному циклу.
 func (l *rustLexer) skipSpacesLookahead() int {
 	p := l.pos
 	for p < l.n {
@@ -171,8 +177,6 @@ func (l *rustLexer) skipSpacesLookahead() int {
 	return p
 }
 
-// curPure возвращает признак "инструкция пока состоит только из цепочки"
-// для текущего уровня скобок.
 func (l *rustLexer) curPure() bool {
 	if n := len(l.bracketStack); n > 0 {
 		return l.bracketStack[n-1].pure
@@ -188,29 +192,22 @@ func (l *rustLexer) setPure(v bool) {
 	}
 }
 
-// notePure обновляет признак "инструкция ещё состоит только из цепочки".
 func (l *rustLexer) notePure(t token) {
 	switch {
 	case t.Text == ";" || t.Text == "{}":
-		l.setPure(true) // конец инструкции или блока
+		l.setPure(true)
 	case t.Operand, t.Text == ".", t.Text == "::", t.Text == "?",
 		strings.HasSuffix(t.Text, "()"), strings.HasSuffix(t.Text, "[]"),
 		strings.HasSuffix(t.Text, "{}"):
-		// цепочка продолжается
 	default:
-		l.setPure(false) // let, =, +, return, => и т.д.
+		l.setPure(false)
 	}
 }
 
-// isPatternEnd: после ")" идёт "=>" или одиночное "=" - это паттерн, а не вызов.
 func (l *rustLexer) isPatternEnd(p int) bool {
 	return p+1 < l.n && l.src[p] == '=' && l.src[p+1] != '='
 }
 
-// typeStop описывает условие окончания типового выражения при его пропуске
-// функцией skipTypeExpr: набор одиночных символов и/или целых слов
-// ("where"), которые на "нулевой" (по отношению к точке входа) глубине
-// скобок сигнализируют конец типа.
 type typeStop struct {
 	chars []byte
 	words []string
@@ -236,18 +233,6 @@ func (l *rustLexer) matchesStop(s typeStop) bool {
 	return false
 }
 
-// skipTypeExpr продвигает l.pos через типовое выражение, НЕ порождая для
-// него токенов (ни операторов, ни операндов) - в соответствии с решением
-// не считать типы данных вовсе (аналог правила Холстеда для Паскаля,
-// где раздел объявлений исключается из подсчёта целиком).
-//
-// Останавливается на первом символе/слове из stop, встреченном на
-// "нулевой" глубине скобок относительно точки входа - вложенные (), [],
-// {} и <> внутри самого типа (Vec<HashMap<K, V>>, fn(i32) -> i32,
-// &'a [i32; 4] и т.п.) корректно увеличивают/уменьшают эту локальную
-// глубину, поэтому не путаются со стоп-символами. Строки/симв. литералы
-// и комментарии внутри типа (на практике - в const generics) тоже
-// корректно пропускаются, не сбивая подсчёт скобок.
 func (l *rustLexer) skipTypeExpr(stop typeStop) {
 	depth := 0
 	for l.pos < l.n {
@@ -263,14 +248,12 @@ func (l *rustLexer) skipTypeExpr(stop typeStop) {
 		case c == '"':
 			l.advanceOverStringBody()
 		case c == '\'':
-			l.lexQuote() // не нужен сам токен - только корректно продвинуть pos
+			l.lexQuote()
 		case c == '(' || c == '{' || c == '[' || c == '<':
 			depth++
 			l.pos++
 		case c == ')' || c == '}' || c == ']' || c == '>':
 			if depth == 0 {
-				// Несбалансированная скобка на нулевой глубине - выходим,
-				// чтобы не застрять и не увести позицию ни туда.
 				return
 			}
 			depth--
@@ -281,14 +264,13 @@ func (l *rustLexer) skipTypeExpr(stop typeStop) {
 	}
 }
 
-// atHRTB: на текущей позиции стоит слово "for", за которым (после пробелов) идёт "<".
 func (l *rustLexer) atHRTB() bool {
 	if !hasPrefix(l.src[l.pos:], "for") {
 		return false
 	}
 	if l.pos > 0 {
 		if b := l.src[l.pos-1]; isIdentStartByte(b) || isDigit(b) {
-			return false // "for" - часть другого идентификатора
+			return false
 		}
 	}
 	save := l.pos
@@ -298,9 +280,6 @@ func (l *rustLexer) atHRTB() bool {
 	return p < l.n && l.src[p] == '<'
 }
 
-// skipGenerics пропускает блок <...>, начиная с '<'. Ничего не считает,
-// кроме HRTB: каждый for<...> внутри превращается в токен "for<>".
-// "->" внутри (F: Fn() -> i32) не считается закрывающей скобкой.
 func (l *rustLexer) skipGenerics() {
 	depth := 0
 	for l.pos < l.n {
@@ -320,7 +299,7 @@ func (l *rustLexer) skipGenerics() {
 			l.extra = append(l.extra, token{Text: "for<>", Operand: false})
 			l.pos += 3
 			l.pos = l.skipSpacesLookahead()
-			l.skipGenerics() // пропускаем <'a, ...> рекурсивно
+			l.skipGenerics()
 		case c == '<':
 			depth++
 			l.pos++
@@ -336,11 +315,7 @@ func (l *rustLexer) skipGenerics() {
 	}
 }
 
-// skipTypeDecl пропускает объявление struct/enum/union целиком, начиная сразу
-// после ключевого слова: имя, <...>, where, тело {...} или (...); и ";".
-// Ничего не считается, в том числе имена вариантов и поля.
 func (l *rustLexer) skipTypeDecl() {
-	// имя
 	l.pos = l.skipSpacesLookahead()
 	for l.pos < l.n {
 		r, size := utf8.DecodeRune(l.src[l.pos:])
@@ -350,7 +325,6 @@ func (l *rustLexer) skipTypeDecl() {
 		l.pos += size
 	}
 
-	// дженерики; for<> внутри объявления не считаем
 	if p := l.skipSpacesLookahead(); p < l.n && l.src[p] == '<' {
 		l.pos = p
 		keep := len(l.extra)
@@ -358,18 +332,16 @@ func (l *rustLexer) skipTypeDecl() {
 		l.extra = l.extra[:keep]
 	}
 
-	// (...) у tuple-структуры и where идут до "{" или ";"
 	l.skipTypeExpr(typeStop{chars: []byte{'{', ';'}})
 
 	if l.pos >= l.n {
 		return
 	}
-	if l.src[l.pos] == ';' { // unit- или tuple-структура
+	if l.src[l.pos] == ';' {
 		l.pos++
 		return
 	}
 
-	// тело в фигурных скобках, с учётом вложенных
 	depth := 0
 	for l.pos < l.n {
 		c := l.src[l.pos]
@@ -397,7 +369,6 @@ func (l *rustLexer) skipTypeDecl() {
 	}
 }
 
-// expectName помечает, что следующий идентификатор - имя объявляемой сущности.
 func (l *rustLexer) expectName() {
 	p := l.skipSpacesLookahead()
 	if p < l.n {
@@ -407,13 +378,11 @@ func (l *rustLexer) expectName() {
 	}
 }
 
-// Lex разбирает весь исходный код и возвращает последовательность токенов.
 func (l *rustLexer) Lex() []token {
 	var tokens []token
 
 	for l.pos < l.n {
-		// Обновляем признак "чистой цепочки" по токенам, добавленным
-		// на предыдущих шагах.
+
 		if len(tokens) > l.seen {
 			for _, t := range tokens[l.seen:] {
 				l.notePure(t)
@@ -423,13 +392,11 @@ func (l *rustLexer) Lex() []token {
 
 		c := l.peek()
 
-		// Пробелы
 		if c == ' ' || c == '\t' || c == '\r' || c == '\n' {
 			l.pos++
 			continue
 		}
 
-		// Комментарии
 		if c == '/' && l.peekAt(1) == '/' {
 			l.skipLineComment()
 			continue
@@ -439,22 +406,18 @@ func (l *rustLexer) Lex() []token {
 			continue
 		}
 
-		// Байтовая raw-строка: br"..." / br#"..."#
 		if tok, ok := l.tryRawByteString(); ok {
 			tokens = append(tokens, tok)
 			continue
 		}
-		// Байтовая строка: b"..."
 		if tok, ok := l.tryByteString(); ok {
 			tokens = append(tokens, tok)
 			continue
 		}
-		// Байтовый символ: b'x'
 		if tok, ok := l.tryByteChar(); ok {
 			tokens = append(tokens, tok)
 			continue
 		}
-		// Raw-строка r"..."/r#"..."# или raw-идентификатор r#ident
 		if tok, ok := l.tryRawStringOrIdent(); ok {
 			tokens = append(tokens, tok)
 			continue
@@ -482,15 +445,18 @@ func (l *rustLexer) Lex() []token {
 			continue
 		}
 
-		// Открывающая скобка (не поглощённая как часть вызова в
-		// lexIdentOrMacro): запоминаем в стеке, токен не выдаём - он
-		// будет выдан один раз при встрече закрывающей пары.
+		// Открывающая скобка. Для "{" дополнительно проверяем, не тело ли
+		// это ожидающей управляющей конструкции (if/while/for/loop/match) -
+		// тогда увеличиваем текущую вложенность и, для match, запоминаем
+		// глубину, на которой будут лежать его ветви.
 		if c == '(' || c == '{' || c == '[' {
 			declish := false
+			isControlBody := false
+			var controlKind byte
 			if c == '{' {
-				l.pendingImpl = false // заголовок impl закончился
+				l.pendingImpl = false
 				if l.headerDepth == len(l.bracketStack) {
-					l.headerDepth = -1 // заголовок if/while/match/... закончился
+					l.headerDepth = -1
 				}
 				if l.pendingDeclHeader {
 					declish = true
@@ -498,21 +464,41 @@ func (l *rustLexer) Lex() []token {
 				} else if n := len(l.bracketStack); n > 0 && l.bracketStack[n-1].isDeclBody {
 					declish = true
 				}
+				if n := len(l.pendingControls); n > 0 && l.pendingControls[n-1].depth == len(l.bracketStack) {
+					p := l.pendingControls[n-1]
+					l.pendingControls = l.pendingControls[:n-1]
+					isControlBody = true
+					controlKind = p.kind
+					l.currentNesting++
+					if l.currentNesting > l.gilb.MaxNesting {
+						l.gilb.MaxNesting = l.currentNesting
+					}
+				}
 			}
-			l.bracketStack = append(l.bracketStack, bracketFrame{char: c, isDeclBody: declish, pure: c == '{'})
+			l.bracketStack = append(l.bracketStack, bracketFrame{
+				char: c, isDeclBody: declish, pure: c == '{',
+				isControlBody: isControlBody, controlKind: controlKind,
+			})
+			if controlKind == 'm' {
+				l.matchBodyDepths = append(l.matchBodyDepths, len(l.bracketStack))
+			}
 			l.pos++
 			continue
 		}
-		// Закрывающая скобка: пара (открывающая+закрывающая) считается
-		// одним терминалом-оператором, например "()", "{}" или "[]".
-		// Если открывающая была частью вызова (callName != ""), выдаём
-		// единый оператор "имя()" вместо generic "()". Вызов в составе
-		// выражения даёт ещё и операнд (возвращаемое значение).
+
+		// Закрывающая скобка. При выходе из тела управляющей конструкции
+		// откатываем вложенность (и, для match, стек глубин его ветвей).
 		if c == ')' || c == '}' || c == ']' {
 			l.pos++
 			if n := len(l.bracketStack); n > 0 {
 				frame := l.bracketStack[n-1]
 				l.bracketStack = l.bracketStack[:n-1]
+				if frame.isControlBody {
+					l.currentNesting--
+					if frame.controlKind == 'm' && len(l.matchBodyDepths) > 0 {
+						l.matchBodyDepths = l.matchBodyDepths[:len(l.matchBodyDepths)-1]
+					}
+				}
 				if frame.callName != "" {
 					opText := frame.callName + bracketPairText(frame.char)
 					tokens = append(tokens, token{Text: opText, Operand: false})
@@ -526,20 +512,11 @@ func (l *rustLexer) Lex() []token {
 					tokens = append(tokens, token{Text: bracketPairText(frame.char), Operand: false})
 				}
 			} else {
-				// Нет соответствующей открывающей - некорректный/усечённый
-				// код; считаем как одиночный оператор, чтобы не терять токен.
 				tokens = append(tokens, token{Text: string(c), Operand: false})
 			}
 			continue
 		}
 
-		// Двоеточие как маркер начала типа: не считаем ни само двоеточие,
-		// ни то, что после него, если это (а) аннотация let/const/static/
-		// type на той же глубине скобок, что и само ключевое слово,
-		// (б) тип параметра прямо внутри списка параметров вызова/функции,
-		// или (в) тип поля прямо в теле struct/enum. Двоеточие после
-		// лайфтайма ('label: loop {...}) - это метка цикла, а не тип,
-		// поэтому исключаем этот случай отдельно.
 		if c == ':' && l.peekAt(1) != ':' {
 			depth := len(l.bracketStack)
 			lastIsLifetimeLabel := len(tokens) > 0 && strings.HasPrefix(tokens[len(tokens)-1].Text, "'")
@@ -548,7 +525,7 @@ func (l *rustLexer) Lex() []token {
 			isAnnotColon := l.pendingAnnot.active && l.pendingAnnot.baseDepth == depth
 			if !lastIsLifetimeLabel && (isParamColon || isFieldColon || isAnnotColon) {
 				l.pendingAnnot.active = false
-				l.pos++ // пропускаем ':', не выдаём токен
+				l.pos++
 				var stop typeStop
 				switch {
 				case isParamColon:
@@ -581,17 +558,20 @@ func (l *rustLexer) Lex() []token {
 				wasTypeAlias := l.pendingAnnot.isTypeAlias
 				l.pendingAnnot.active = false
 				if wasTypeAlias {
-					// "type Name = Type;" - двоеточия нет, весь тип идёт
-					// сразу после "=" и до ";".
 					l.skipTypeExpr(typeStop{chars: []byte{';'}})
 				}
 			}
 		case "->":
-			// Возвращаемый тип функции/замыкания/трейт-баунда: сама стрелка -
-			// такой же маркер типа, как и ":", поэтому тоже не считается;
-			// пропускаем весь тип до тела "{", ";" (сигнатура без тела,
-			// напр. в trait) или "where".
 			l.skipTypeExpr(typeStop{chars: []byte{'{', ';'}, words: []string{"where"}})
+		case "=>":
+			// Ветвь match: считаем в сложность Джилба, только если "=>"
+			// стоит на глубине ветвей ближайшего открытого match, а не
+			// внутри тела самой ветви (там могут быть свои "{...}").
+			tokens = append(tokens, tok)
+			isWildcard := len(tokens) >= 2 && tokens[len(tokens)-2].Text == "_"
+			if n := len(l.matchBodyDepths); n > 0 && l.matchBodyDepths[n-1] == len(l.bracketStack) && !isWildcard {
+				l.gilb.Absolute++
+			}
 		default:
 			tokens = append(tokens, tok)
 		}
@@ -607,7 +587,7 @@ func (l *rustLexer) skipLineComment() {
 }
 
 func (l *rustLexer) skipBlockComment() {
-	l.pos += 2 // "/*"
+	l.pos += 2
 	depth := 1
 	for l.pos < l.n && depth > 0 {
 		if l.src[l.pos] == '/' && l.peekAt(1) == '*' {
@@ -624,7 +604,6 @@ func (l *rustLexer) skipBlockComment() {
 	}
 }
 
-// tryRawByteString разбирает br"..." / br#"..."#.
 func (l *rustLexer) tryRawByteString() (token, bool) {
 	if l.peek() != 'b' || l.peekAt(1) != 'r' {
 		return token{}, false
@@ -649,29 +628,26 @@ func (l *rustLexer) tryRawByteString() (token, bool) {
 	return token{Text: string(l.src[start:l.pos]), Operand: true}, true
 }
 
-// tryByteString разбирает b"...".
 func (l *rustLexer) tryByteString() (token, bool) {
 	if l.peek() != 'b' || l.peekAt(1) != '"' {
 		return token{}, false
 	}
 	start := l.pos
-	l.pos++ // пропускаем 'b', дальше как обычная строка
+	l.pos++
 	l.advanceOverStringBody()
 	return token{Text: string(l.src[start:l.pos]), Operand: true}, true
 }
 
-// tryByteChar разбирает b'x'.
 func (l *rustLexer) tryByteChar() (token, bool) {
 	if l.peek() != 'b' || l.peekAt(1) != '\'' {
 		return token{}, false
 	}
 	start := l.pos
-	l.pos++ // пропускаем 'b'
+	l.pos++
 	l.advanceOverCharBody()
 	return token{Text: string(l.src[start:l.pos]), Operand: true}, true
 }
 
-// tryRawStringOrIdent разбирает r"...", r#"..."# или сырой идентификатор r#ident.
 func (l *rustLexer) tryRawStringOrIdent() (token, bool) {
 	if l.peek() != 'r' {
 		return token{}, false
@@ -695,7 +671,6 @@ func (l *rustLexer) tryRawStringOrIdent() (token, bool) {
 		return token{Text: string(l.src[start:l.pos]), Operand: true}, true
 	}
 
-	// Сырой идентификатор: ровно один '#' и дальше начало идентификатора.
 	if hashes == 1 && p < l.n {
 		if r, _ := utf8.DecodeRune(l.src[p:]); isIdentStart(r) {
 			q := p
@@ -715,7 +690,7 @@ func (l *rustLexer) tryRawStringOrIdent() (token, bool) {
 }
 
 func (l *rustLexer) advanceOverStringBody() {
-	l.pos++ // открывающая кавычка
+	l.pos++
 	for l.pos < l.n {
 		c := l.src[l.pos]
 		if c == '\\' {
@@ -737,7 +712,7 @@ func (l *rustLexer) lexString() token {
 }
 
 func (l *rustLexer) advanceOverCharBody() {
-	l.pos++ // открывающая кавычка
+	l.pos++
 	for l.pos < l.n {
 		c := l.src[l.pos]
 		if c == '\\' {
@@ -749,13 +724,12 @@ func (l *rustLexer) advanceOverCharBody() {
 			return
 		}
 		if c == '\n' {
-			return // некорректный литерал, выходим
+			return
 		}
 		l.pos++
 	}
 }
 
-// lexQuote разбирает символьный литерал 'x'/'\n' либо лайфтайм 'a/'static.
 func (l *rustLexer) lexQuote() token {
 	start := l.pos
 
@@ -777,7 +751,6 @@ func (l *rustLexer) lexQuote() token {
 		}
 	}
 
-	// Не символьный литерал -> лайфтайм ('a, 'static) или одинокий тик.
 	p := l.pos + 1
 	for p < l.n {
 		r, size := utf8.DecodeRune(l.src[p:])
@@ -794,7 +767,6 @@ func (l *rustLexer) lexQuote() token {
 	return token{Text: string(l.src[start:l.pos]), Operand: false}
 }
 
-// lexNumber разбирает целые/дробные литералы, включая 0x/0o/0b, экспоненту и суффиксы.
 func (l *rustLexer) lexNumber() token {
 	start := l.pos
 
@@ -818,7 +790,6 @@ func (l *rustLexer) lexNumber() token {
 		for l.pos < l.n && (isDigit(l.src[l.pos]) || l.src[l.pos] == '_') {
 			l.pos++
 		}
-		// Дробная часть: не трогаем ".." (range) и "1.method()" (доступ к полю/методу).
 		if l.pos < l.n && l.src[l.pos] == '.' &&
 			l.peekAt(1) != '.' && !isIdentStartByte(l.peekAt(1)) {
 			l.pos++
@@ -826,7 +797,6 @@ func (l *rustLexer) lexNumber() token {
 				l.pos++
 			}
 		}
-		// Экспонента.
 		if l.pos < l.n && (l.src[l.pos] == 'e' || l.src[l.pos] == 'E') {
 			save := l.pos
 			p := l.pos + 1
@@ -844,7 +814,6 @@ func (l *rustLexer) lexNumber() token {
 		}
 	}
 
-	// Суффикс типа (u32, i64, usize, f64, ...).
 	for l.pos < l.n {
 		r, size := utf8.DecodeRune(l.src[l.pos:])
 		if !isIdentContinue(r) {
@@ -856,16 +825,6 @@ func (l *rustLexer) lexNumber() token {
 	return token{Text: string(l.src[start:l.pos]), Operand: true}
 }
 
-// lexIdentOrMacro разбирает идентификатор/ключевое слово, макро-вызов ident!,
-// вызов функции/метода ident(...) либо конструкцию "Имя { ... }".
-//
-// Возвращает (token, true), если токен нужно сразу добавить в поток, либо
-// (_, false), если идентификатор оказался именем вызова: открывающая "("
-// уже поглощена и помещена в bracketStack с этим именем - итоговый
-// оператор "имя()" будет выдан позже, при встрече закрывающей скобки
-// (см. основной цикл Lex). Это отражает определение Холстеда: имя
-// процедуры/функции - оператор, а пара скобок вызова не считается
-// отдельно (иначе она задвоила бы счёт).
 func (l *rustLexer) lexIdentOrMacro() (token, bool) {
 	start := l.pos
 	for l.pos < l.n {
@@ -877,10 +836,6 @@ func (l *rustLexer) lexIdentOrMacro() (token, bool) {
 	}
 	text := string(l.src[start:l.pos])
 
-	// Макро-вызов: ident! (но не "!="). У макросов Rust разделителем
-	// аргументов может быть "(", "[" или "{" (println!(...), vec![...],
-	// lazy_static!{...}) - схлопываем имя+"!" вместе с этой скобкой в один
-	// оператор, по той же логике, что и для обычных вызовов функций.
 	if l.peek() == '!' && l.peekAt(1) != '=' {
 		l.pos++
 		macroName := text + "!"
@@ -898,8 +853,6 @@ func (l *rustLexer) lexIdentOrMacro() (token, bool) {
 				return token{}, false
 			}
 		}
-		// Разделитель не найден сразу (например, макрос без тела) -
-		// просто выдаём имя макроса как самостоятельный оператор.
 		return token{Text: macroName, Operand: false}, true
 	}
 
@@ -914,36 +867,47 @@ func (l *rustLexer) lexIdentOrMacro() (token, bool) {
 		case "impl":
 			l.pendingImpl = true
 			l.headerDepth = len(l.bracketStack)
-			// impl<T: ...> - пропускаем дженерики сразу после impl
 			if p := l.skipSpacesLookahead(); p < l.n && l.src[p] == '<' {
 				l.pos = p
 				l.skipGenerics()
 			}
-		case "if", "while", "match", "where":
+		case "if", "while":
+			// Обычное ветвление/цикл: сразу считаем в AC и ставим "ожидание
+			// тела" для подсчёта вложенности.
+			l.headerDepth = len(l.bracketStack)
+			l.pendingControls = append(l.pendingControls, controlPending{depth: len(l.bracketStack), kind: 'o'})
+			l.gilb.Absolute++
+		case "loop":
+			l.pendingControls = append(l.pendingControls, controlPending{depth: len(l.bracketStack), kind: 'o'})
+			l.gilb.Absolute++
+		case "match":
+			// Сам match в AC не добавляем - складываем число его ветвей
+			// (см. обработку "=>" в Lex), но вложенность считаем как у
+			// обычной управляющей конструкции.
+			l.headerDepth = len(l.bracketStack)
+			l.pendingControls = append(l.pendingControls, controlPending{depth: len(l.bracketStack), kind: 'm'})
+		case "where":
 			l.headerDepth = len(l.bracketStack)
 		case "for":
-			// HRTB: for<'a> - один оператор "for<>"
 			if p := l.skipSpacesLookahead(); p < l.n && l.src[p] == '<' {
 				l.pos = p
 				l.skipGenerics()
 				return token{Text: "for<>", Operand: false}, true
 			}
-			// impl Trait for Type
 			if l.pendingImpl {
 				l.pendingImpl = false
 				return token{Text: "impl-for", Operand: false}, true
 			}
 			// обычный цикл for
 			l.headerDepth = len(l.bracketStack)
+			l.pendingControls = append(l.pendingControls, controlPending{depth: len(l.bracketStack), kind: 'o'})
+			l.gilb.Absolute++
 		case "fn":
 			l.expectName()
 		case "trait":
 			l.expectName()
 			l.headerDepth = len(l.bracketStack)
 		case "struct", "enum", "union":
-			// От этого места и до "(" / "{" тела (или ";" для unit-struct) -
-			// заголовок объявления типа: следующее тело нужно пометить как
-			// isDeclBody (поля/варианты, а не вызовы/литералы/код).
 			l.skipTypeDecl()
 		case "let", "const", "static":
 			l.pendingAnnot = pendingAnnotation{active: true, baseDepth: len(l.bracketStack)}
@@ -954,21 +918,16 @@ func (l *rustLexer) lexIdentOrMacro() (token, bool) {
 		return token{Text: text, Operand: false}, true
 	}
 
-	// Имя после fn/struct/enum/union/trait/type: пропускаем <...>,
-	// дальше идентификатор идёт по обычному пути (проверка на "(" и "{").
-	wasName := l.pendingName // это имя объявляемой сущности (fn/struct/...)
+	wasName := l.pendingName
 	name := text
 	if l.pendingName {
 		l.pendingName = false
 		if p := l.skipSpacesLookahead(); p < l.n && l.src[p] == '<' {
 			l.pos = p
 			l.skipGenerics()
-			// name = text + "<>" // раскомментируй, если нужно отличать generic-объявления
 		}
 	}
 
-	// "Имя { ... }" с заглавной буквы вне заголовка блока: struct/enum-вариант
-	// (объявление), литерал или паттерн. Считается как вызов "Имя{}".
 	if p := l.skipSpacesLookahead(); p < l.n && l.src[p] == '{' &&
 		l.headerDepth != len(l.bracketStack) {
 		if r, _ := utf8.DecodeRuneInString(name); unicode.IsUpper(r) {
@@ -993,17 +952,9 @@ func (l *rustLexer) lexIdentOrMacro() (token, bool) {
 		}
 	}
 
-	// Обычный идентификатор: смотрим вперёд (пропуская только пробелы) -
-	// не следует ли за ним "(" вызова. Это покрывает вызовы функций,
-	// методов (obj.method()) и конструкторы tuple-структур Foo(...).
 	if p := l.skipSpacesLookahead(); p < l.n && l.src[p] == '(' {
-		l.pos = p + 1 // поглощаем пробелы и открывающую скобку
+		l.pos = p + 1
 
-		// Если это заголовок struct/enum/union (tuple-struct или
-		// tuple-вариант перечисления) или мы уже внутри тела struct/enum
-		// (isDeclBody) - вся эта "(...)" является списком ТИПОВ полей,
-		// а не аргументов вызова: сама пара имя+скобки остаётся одним
-		// оператором ("Foo()"), а типы внутри не считаются вовсе.
 		declish := l.pendingDeclHeader
 		if !declish {
 			if n := len(l.bracketStack); n > 0 && l.bracketStack[n-1].isDeclBody {
@@ -1034,11 +985,6 @@ var twoCharOps = []string{
 	"+=", "-=", "*=", "/=", "%=", "^=", "&=", "|=", "<<", ">>", "..",
 }
 
-// bracketPairText возвращает канонический текст терминала для пары скобок.
-// Угловые скобки <> намеренно не входят сюда: символ '<'/'>' неотделим на
-// уровне лексера от операторов сравнения (< > <= >=), поэтому их надёжно
-// сопоставить без разбора грамматики нельзя - они остаются одиночными
-// операторами, как обычные знаки сравнения.
 func bracketPairText(open byte) string {
 	switch open {
 	case '(':
@@ -1051,8 +997,6 @@ func bracketPairText(open byte) string {
 	return string(open)
 }
 
-// lexPunct разбирает операторы и пунктуацию (кроме (){}[] - те сворачиваются
-// в единый терминал парой ещё в основном цикле Lex).
 func (l *rustLexer) lexPunct() token {
 	remaining := l.src[l.pos:]
 
@@ -1101,9 +1045,6 @@ func isIdentStartByte(c byte) bool {
 	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
-// rustKeywords - ключевые слова Rust (строгие + зарезервированные), кроме
-// true/false (считаются литералами-операндами) и self/Self (считаются
-// операндами, так как обозначают значение/тип, а не управляющую конструкцию).
 var rustKeywords = map[string]bool{
 	"as": true, "async": true, "await": true, "break": true,
 	"const": true, "continue": true, "crate": true, "dyn": true,
@@ -1113,7 +1054,6 @@ var rustKeywords = map[string]bool{
 	"ref": true, "return": true, "static": true, "struct": true,
 	"super": true, "trait": true, "type": true, "unsafe": true,
 	"use": true, "where": true, "while": true,
-	// зарезервированные / контекстные
 	"abstract": true, "become": true, "box": true, "do": true,
 	"final": true, "macro": true, "override": true, "priv": true,
 	"typeof": true, "unsized": true, "virtual": true, "yield": true,

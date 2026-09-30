@@ -18,22 +18,40 @@ type TableRow struct {
 	Count string
 }
 
-// AppGUI инкапсулирует в себе все элементы управления интерфейсом
 type AppGUI struct {
-	window        fyne.Window
-	lblFile       *widget.Label
-	lblN1         *widget.Label
-	lblN2         *widget.Label
-	lblTotalN1    *widget.Label
-	lblTotalN2    *widget.Label
-	lblVocab      *widget.Label
-	lblLen        *widget.Label
-	lblVol        *widget.Label
+	window fyne.Window
+
+	lblFile   *widget.Label
+	lblSource *widget.Label
+
+	// Метрики Холстеда
+	lblN1      *widget.Label
+	lblN2      *widget.Label
+	lblTotalN1 *widget.Label
+	lblTotalN2 *widget.Label
+	lblVocab   *widget.Label
+	lblLen     *widget.Label
+	lblVol     *widget.Label
+
 	opRows        []TableRow
 	valRows       []TableRow
 	listOperators *widget.List
 	listOperands  *widget.List
-	lblSource     *widget.Label
+
+	// Метрики Джилба
+	lblGilbAbs  *widget.Label
+	lblGilbRel  *widget.Label
+	lblGilbNest *widget.Label
+
+	// metricsArea переключается между placeholder/halsteadView/gilbView -
+	// одновременно показывается только один из наборов метрик.
+	metricsArea  *fyne.Container
+	placeholder  fyne.CanvasObject
+	halsteadView fyne.CanvasObject
+	gilbView     fyne.CanvasObject
+
+	currentFilePath string
+	metrics         *StructuralMetrics // кэш результата анализа текущего файла
 }
 
 func NewAppGUI(w fyne.Window) *AppGUI {
@@ -46,6 +64,40 @@ func (g *AppGUI) initUI() {
 	g.lblFile = widget.NewLabel("Файл не выбран")
 	g.lblFile.TextStyle = fyne.TextStyle{Italic: true}
 
+	g.lblSource = widget.NewLabel("")
+	g.lblSource.TextStyle = fyne.TextStyle{Monospace: true}
+	sourceScroll := container.NewScroll(g.lblSource)
+	sourcePanel := container.NewBorder(
+		widget.NewLabelWithStyle("Исходный код", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+		nil, nil, nil,
+		sourceScroll,
+	)
+
+	g.buildHalsteadView()
+	g.buildGilbView()
+	g.placeholder = widget.NewLabel("Откройте файл и выберите метрику для расчёта.")
+
+	g.metricsArea = container.NewStack(g.placeholder)
+
+	btnOpen := widget.NewButton("Открыть файл", g.handleOpenFile)
+	btnHalstead := widget.NewButton("Посчитать метрики Холстеда", g.handleComputeHalstead)
+	btnGilb := widget.NewButton("Посчитать метрики Джилба", g.handleComputeGilb)
+
+	topContainer := container.NewVBox(
+		container.NewHBox(btnOpen, btnHalstead, btnGilb),
+		g.lblFile,
+	)
+
+	split := container.NewHSplit(sourcePanel, g.metricsArea)
+	split.Offset = 0.4
+
+	mainLayout := container.NewBorder(topContainer, nil, nil, nil, split)
+	g.window.SetContent(mainLayout)
+}
+
+// buildHalsteadView собирает панель с метриками Холстеда и таблицами
+// операторов/операндов. Ничего, относящегося к Джилбу, здесь нет.
+func (g *AppGUI) buildHalsteadView() {
 	g.lblN1 = widget.NewLabel("η1 (Словарь операторов): -")
 	g.lblN2 = widget.NewLabel("η2 (Словарь операндов): -")
 	g.lblTotalN1 = widget.NewLabel("N1 (Всего операторов): -")
@@ -53,6 +105,13 @@ func (g *AppGUI) initUI() {
 	g.lblVocab = widget.NewLabel("η (Словарь программы): -")
 	g.lblLen = widget.NewLabel("N (Длина программы): -")
 	g.lblVol = widget.NewLabel("V (Объем программы): -")
+
+	metricsBox := container.NewVBox(
+		widget.NewLabelWithStyle("Метрики Холстеда:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		g.lblN1, g.lblN2, g.lblTotalN1, g.lblTotalN2,
+		widget.NewSeparator(),
+		g.lblVocab, g.lblLen, g.lblVol,
+	)
 
 	g.listOperators = widget.NewList(
 		func() int { return len(g.opRows) },
@@ -63,7 +122,6 @@ func (g *AppGUI) initUI() {
 			}
 		},
 	)
-
 	g.listOperands = widget.NewList(
 		func() int { return len(g.valRows) },
 		func() fyne.CanvasObject { return widget.NewLabel("") },
@@ -74,38 +132,36 @@ func (g *AppGUI) initUI() {
 		},
 	)
 
-	g.lblSource = widget.NewLabel("")
-	g.lblSource.TextStyle = fyne.TextStyle{Monospace: true}
-	sourceScroll := container.NewScroll(g.lblSource)
-
-	sourcePanel := container.NewBorder(
-		widget.NewLabelWithStyle("Исходный код", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
-		nil, nil, nil,
-		sourceScroll,
-	)
-
-	btnOpen := widget.NewButton("Открыть Rust файл", g.handleOpenFile)
-
-	topContainer := container.NewVBox(btnOpen, g.lblFile)
-	metricsContainer := container.NewVBox(
-		widget.NewLabelWithStyle("Итоговые результаты:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		g.lblN1, g.lblN2, g.lblTotalN1, g.lblTotalN2,
-		widget.NewSeparator(),
-		g.lblVocab, g.lblLen, g.lblVol,
-	)
-
 	tablesContainer := container.NewGridWithColumns(2,
 		container.NewBorder(widget.NewLabelWithStyle("Операторы", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}), nil, nil, nil, g.listOperators),
 		container.NewBorder(widget.NewLabelWithStyle("Операнды", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}), nil, nil, nil, g.listOperands),
 	)
 
-	split := container.NewHSplit(sourcePanel, tablesContainer)
-	split.Offset = 0.4
-
-	mainLayout := container.NewBorder(topContainer, nil, metricsContainer, nil, split)
-	g.window.SetContent(mainLayout)
+	g.halsteadView = container.NewBorder(metricsBox, nil, nil, nil, tablesContainer)
 }
 
+// buildGilbView собирает панель с метриками Джилба. Ничего, относящегося
+// к Холстеду (словари, таблицы), здесь нет.
+func (g *AppGUI) buildGilbView() {
+	g.lblGilbAbs = widget.NewLabel("AC (Абсолютная сложность): -")
+	g.lblGilbRel = widget.NewLabel("OC (Относительная сложность): -")
+	g.lblGilbNest = widget.NewLabel("Максимальный уровень вложенности: -")
+
+	g.gilbView = container.NewVBox(
+		widget.NewLabelWithStyle("Метрики Джилба:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		g.lblGilbAbs, g.lblGilbRel, g.lblGilbNest,
+	)
+}
+
+// showView переключает правую панель на один из трёх видов; остальные
+// два в этот момент не показываются.
+func (g *AppGUI) showView(view fyne.CanvasObject) {
+	g.metricsArea.Objects = []fyne.CanvasObject{view}
+	g.metricsArea.Refresh()
+}
+
+// handleOpenFile только загружает файл и показывает исходный код.
+// Никакие метрики при этом не считаются и не выводятся.
 func (g *AppGUI) handleOpenFile() {
 	fd := dialog.NewFileOpen(func(reader fyne.URIReadCloser, err error) {
 		if err != nil || reader == nil {
@@ -118,46 +174,88 @@ func (g *AppGUI) handleOpenFile() {
 			}
 		}(reader)
 
-		g.lblFile.SetText("Анализ: " + reader.URI().Name())
-
 		data, err := io.ReadAll(reader)
 		if err != nil {
 			dialog.ShowError(err, g.window)
 			return
 		}
+
+		g.currentFilePath = reader.URI().Path()
+		g.metrics = nil // сбрасываем кэш - файл новый, метрики нужно посчитать заново
+
+		g.lblFile.SetText("Файл: " + reader.URI().Name())
 		g.lblSource.SetText(strings.ReplaceAll(string(data), "\r\n", "\n"))
 
-		metrics, err := AnalyzeRustFile(reader.URI().Path())
-		if err != nil {
-			dialog.ShowError(err, g.window)
-			return
-		}
-
-		g.lblN1.SetText(fmt.Sprintf("η1 (Словарь операторов): %.0f", metrics.N1))
-		g.lblN2.SetText(fmt.Sprintf("η2 (Словарь операндов): %.0f", metrics.N2))
-		g.lblTotalN1.SetText(fmt.Sprintf("N1 (Всего операторов): %.0f", metrics.TotalN1))
-		g.lblTotalN2.SetText(fmt.Sprintf("N2 (Всего операндов): %.0f", metrics.TotalN2))
-		g.lblVocab.SetText(fmt.Sprintf("η (Словарь программы): %.0f + %.0f = %.0f", metrics.N1, metrics.N2, metrics.Vocabulary))
-		g.lblLen.SetText(fmt.Sprintf("N (Длина программы): %.0f + %.0f = %.0f", metrics.TotalN1, metrics.TotalN2, metrics.Length))
-		g.lblVol.SetText(fmt.Sprintf("V (Объем программы): %.0f * log2(%.0f) = %.0f бит", metrics.Length, metrics.Vocabulary, metrics.Volume))
-
-		g.opRows = nil
-		for k, v := range metrics.Operators {
-			g.opRows = append(g.opRows, TableRow{Key: k, Count: fmt.Sprintf("%d", v)})
-		}
-		sort.Slice(g.opRows, func(i, j int) bool { return g.opRows[i].Key < g.opRows[j].Key })
-
-		g.valRows = nil
-		for k, v := range metrics.Operands {
-			g.valRows = append(g.valRows, TableRow{Key: k, Count: fmt.Sprintf("%d", v)})
-		}
-		sort.Slice(g.valRows, func(i, j int) bool { return g.valRows[i].Key < g.valRows[j].Key })
-
-		g.listOperators.Refresh()
-		g.listOperands.Refresh()
-
+		g.showView(g.placeholder)
 	}, g.window)
 
 	fd.SetFilter(storage.NewExtensionFileFilter([]string{".rs"}))
 	fd.Show()
+}
+
+// ensureMetrics считает метрики для текущего файла один раз и кэширует
+// результат, чтобы обе кнопки могли им пользоваться без повторного анализа.
+func (g *AppGUI) ensureMetrics() (*StructuralMetrics, bool) {
+	if g.currentFilePath == "" {
+		dialog.ShowInformation("Нет файла", "Сначала откройте Rust файл.", g.window)
+		return nil, false
+	}
+	if g.metrics != nil {
+		return g.metrics, true
+	}
+	metrics, err := AnalyzeRustFile(g.currentFilePath)
+	if err != nil {
+		dialog.ShowError(err, g.window)
+		return nil, false
+	}
+	g.metrics = metrics
+	return metrics, true
+}
+
+// handleComputeHalstead показывает только метрики Холстеда.
+func (g *AppGUI) handleComputeHalstead() {
+	metrics, ok := g.ensureMetrics()
+	if !ok {
+		return
+	}
+
+	g.lblN1.SetText(fmt.Sprintf("η1 (Словарь операторов): %.0f", metrics.N1))
+	g.lblN2.SetText(fmt.Sprintf("η2 (Словарь операндов): %.0f", metrics.N2))
+	g.lblTotalN1.SetText(fmt.Sprintf("N1 (Всего операторов): %.0f", metrics.TotalN1))
+	g.lblTotalN2.SetText(fmt.Sprintf("N2 (Всего операндов): %.0f", metrics.TotalN2))
+	g.lblVocab.SetText(fmt.Sprintf("η (Словарь программы): %.0f + %.0f = %.0f", metrics.N1, metrics.N2, metrics.Vocabulary))
+	g.lblLen.SetText(fmt.Sprintf("N (Длина программы): %.0f + %.0f = %.0f", metrics.TotalN1, metrics.TotalN2, metrics.Length))
+	g.lblVol.SetText(fmt.Sprintf("V (Объем программы): %.0f * log2(%.0f) = %.0f бит", metrics.Length, metrics.Vocabulary, metrics.Volume))
+
+	g.opRows = nil
+	for k, v := range metrics.Operators {
+		g.opRows = append(g.opRows, TableRow{Key: k, Count: fmt.Sprintf("%d", v)})
+	}
+	sort.Slice(g.opRows, func(i, j int) bool { return g.opRows[i].Key < g.opRows[j].Key })
+
+	g.valRows = nil
+	for k, v := range metrics.Operands {
+		g.valRows = append(g.valRows, TableRow{Key: k, Count: fmt.Sprintf("%d", v)})
+	}
+	sort.Slice(g.valRows, func(i, j int) bool { return g.valRows[i].Key < g.valRows[j].Key })
+
+	g.listOperators.Refresh()
+	g.listOperands.Refresh()
+
+	g.showView(g.halsteadView)
+}
+
+// handleComputeGilb показывает только метрики Джилба.
+func (g *AppGUI) handleComputeGilb() {
+	metrics, ok := g.ensureMetrics()
+	if !ok {
+		return
+	}
+
+	m := metrics.Gilb
+	g.lblGilbAbs.SetText(fmt.Sprintf("AC (Абсолютная сложность): %d", m.Absolute))
+	g.lblGilbRel.SetText(fmt.Sprintf("OC (Относительная сложность): %.3f", m.Relative))
+	g.lblGilbNest.SetText(fmt.Sprintf("Максимальный уровень вложенности: %d", m.MaxNesting))
+
+	g.showView(g.gilbView)
 }
