@@ -70,8 +70,14 @@ func AnalyzeRustFile(filePath string) (*StructuralMetrics, error) {
 	}
 
 	res.Gilb = lexer.gilb
-	if res.TotalN1 > 0 {
-		res.Gilb.Relative = float64(res.Gilb.Absolute) / res.TotalN1
+	refOps := 0
+	for opText, count := range res.Operators {
+		if referenceOperators[opText] {
+			refOps += count
+		}
+	}
+	if refOps > 0 {
+		res.Gilb.Relative = float64(res.Gilb.Absolute) / float64(refOps)
 	}
 
 	return res, nil
@@ -1058,4 +1064,25 @@ var rustKeywords = map[string]bool{
 	"final": true, "macro": true, "override": true, "priv": true,
 	"typeof": true, "unsized": true, "virtual": true, "yield": true,
 	"try": true, "union": true,
+}
+
+var referenceOperators = map[string]bool{
+	// арифметические и побитовые (бинарные), они же унарные - и *
+	"+": true, "-": true, "*": true, "/": true, "%": true,
+	"^": true, "&": true, "|": true, "<<": true, ">>": true,
+	// сравнение
+	"==": true, "!=": true, "<": true, ">": true, "<=": true, ">=": true,
+	// логические (ленивые)
+	"&&": true, "||": true,
+	// унарное отрицание
+	"!": true,
+	// присваивание и составное присваивание
+	"=": true, "+=": true, "-=": true, "*=": true, "/=": true, "%=": true,
+	"^=": true, "&=": true, "|=": true, "<<=": true, ">>=": true,
+	// диапазоны
+	"..": true, "..=": true,
+	// оператор "?"
+	"?": true,
+	// приведение типа
+	"as": true,
 }
