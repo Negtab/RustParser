@@ -39,9 +39,13 @@ type AppGUI struct {
 	listOperands  *widget.List
 
 	// Метрики Джилба
-	lblGilbAbs  *widget.Label
-	lblGilbRel  *widget.Label
-	lblGilbNest *widget.Label
+	lblGilbAbs   *widget.Label
+	lblGilbRel   *widget.Label
+	lblGilbCount *widget.Label
+	lblGilbNest  *widget.Label
+
+	gilbOpRows  []TableRow
+	listGilbOps *widget.List
 
 	// metricsArea переключается между placeholder/halsteadView/gilbView -
 	// одновременно показывается только один из наборов метрик.
@@ -142,15 +146,34 @@ func (g *AppGUI) buildHalsteadView() {
 
 // buildGilbView собирает панель с метриками Джилба. Ничего, относящегося
 // к Холстеду (словари, таблицы), здесь нет.
+// buildGilbView собирает панель с метриками Джилба и списком операторов,
+// учтённых в знаменателе OC (узкий список по Rust Reference). Ничего,
+// относящегося к Холстеду (словари, таблицы операторов/операндов из
+// лексера), здесь нет.
 func (g *AppGUI) buildGilbView() {
 	g.lblGilbAbs = widget.NewLabel("AC (Абсолютная сложность): -")
 	g.lblGilbRel = widget.NewLabel("OC (Относительная сложность): -")
+	g.lblGilbCount = widget.NewLabel("Количество операторов: -")
 	g.lblGilbNest = widget.NewLabel("Максимальный уровень вложенности: -")
 
-	g.gilbView = container.NewVBox(
+	metricsBox := container.NewVBox(
 		widget.NewLabelWithStyle("Метрики Джилба:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
-		g.lblGilbAbs, g.lblGilbRel, g.lblGilbNest,
+		g.lblGilbAbs, g.lblGilbRel, g.lblGilbCount, g.lblGilbNest,
+		widget.NewSeparator(),
+		widget.NewLabelWithStyle("Операторы, учтённые в OC:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 	)
+
+	g.listGilbOps = widget.NewList(
+		func() int { return len(g.gilbOpRows) },
+		func() fyne.CanvasObject { return widget.NewLabel("") },
+		func(i widget.ListItemID, o fyne.CanvasObject) {
+			if i < len(g.gilbOpRows) {
+				o.(*widget.Label).SetText(fmt.Sprintf("%s : %s", g.gilbOpRows[i].Key, g.gilbOpRows[i].Count))
+			}
+		},
+	)
+
+	g.gilbView = container.NewBorder(metricsBox, nil, nil, nil, g.listGilbOps)
 }
 
 // showView переключает правую панель на один из трёх видов; остальные
@@ -253,9 +276,30 @@ func (g *AppGUI) handleComputeGilb() {
 	}
 
 	m := metrics.Gilb
+	if m.MaxNesting != 0 {
+	  m.MaxNesting--
+	}
+
 	g.lblGilbAbs.SetText(fmt.Sprintf("AC (Абсолютная сложность): %d", m.Absolute))
 	g.lblGilbRel.SetText(fmt.Sprintf("OC (Относительная сложность): %.3f", m.Relative))
+	g.lblGilbCount.SetText(fmt.Sprintf("Количество операторов: %d", m.Count))
 	g.lblGilbNest.SetText(fmt.Sprintf("Максимальный уровень вложенности: %d", m.MaxNesting))
+
+	g.gilbOpRows = nil
+	for k, v := range metrics.Operators {
+		if referenceOperators[k] {
+			g.gilbOpRows = append(g.gilbOpRows, TableRow{Key: k, Count: fmt.Sprintf("%d", v)})
+		}
+	}
+	sort.Slice(g.gilbOpRows, func(i, j int) bool { return g.gilbOpRows[i].Key < g.gilbOpRows[j].Key })
+
+	for _, kind := range []string{"if", "for", "while", "loop", "match"} {
+		if v, ok := m.Kinds[kind]; ok {
+			g.gilbOpRows = append(g.gilbOpRows, TableRow{Key: kind, Count: fmt.Sprintf("%d", v)})
+		}
+	}
+
+	g.listGilbOps.Refresh()
 
 	g.showView(g.gilbView)
 }

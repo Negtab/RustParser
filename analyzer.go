@@ -31,7 +31,9 @@ type StructuralMetrics struct {
 type GilbMetrics struct {
 	Absolute   int     // AC: число циклов, ветвлений и вариантов match
 	Relative   float64 // OC: AC / TotalN1 (общее число операторов Холстеда)
-	MaxNesting int     // максимальный уровень вложенности управляющих конструкций
+	Count      int
+	MaxNesting int            // максимальный уровень вложенности управляющих конструкций
+	Kinds      map[string]int // разбивка AC по видам: if, for, while, loop, match (ветви)
 }
 
 func AnalyzeRustFile(filePath string) (*StructuralMetrics, error) {
@@ -70,8 +72,15 @@ func AnalyzeRustFile(filePath string) (*StructuralMetrics, error) {
 	}
 
 	res.Gilb = lexer.gilb
-	if res.TotalN1 > 0 {
-		res.Gilb.Relative = float64(res.Gilb.Absolute) / res.TotalN1
+	refOps := 0
+	for opText, count := range res.Operators {
+		if referenceOperators[opText] {
+			refOps += count
+		}
+	}
+	if refOps > 0 {
+		res.Gilb.Count = refOps + res.Gilb.Absolute
+		res.Gilb.Relative = float64(res.Gilb.Absolute) / (float64(refOps) + float64(res.Gilb.Absolute))
 	}
 
 	return res, nil
@@ -147,6 +156,7 @@ func newRustLexer(src []byte) *rustLexer {
 		rootPure:     true,
 		headerDepth:  -1,
 		pendingAnnot: pendingAnnotation{baseDepth: -1},
+		gilb:         GilbMetrics{Kinds: make(map[string]int)},
 	}
 }
 
@@ -564,13 +574,11 @@ func (l *rustLexer) Lex() []token {
 		case "->":
 			l.skipTypeExpr(typeStop{chars: []byte{'{', ';'}, words: []string{"where"}})
 		case "=>":
-			// Ветвь match: считаем в сложность Джилба, только если "=>"
-			// стоит на глубине ветвей ближайшего открытого match, а не
-			// внутри тела самой ветви (там могут быть свои "{...}").
 			tokens = append(tokens, tok)
 			isWildcard := len(tokens) >= 2 && tokens[len(tokens)-2].Text == "_"
 			if n := len(l.matchBodyDepths); n > 0 && l.matchBodyDepths[n-1] == len(l.bracketStack) && !isWildcard {
 				l.gilb.Absolute++
+				l.gilb.Kinds["match"]++
 			}
 		default:
 			tokens = append(tokens, tok)
@@ -872,14 +880,14 @@ func (l *rustLexer) lexIdentOrMacro() (token, bool) {
 				l.skipGenerics()
 			}
 		case "if", "while":
-			// Обычное ветвление/цикл: сразу считаем в AC и ставим "ожидание
-			// тела" для подсчёта вложенности.
 			l.headerDepth = len(l.bracketStack)
 			l.pendingControls = append(l.pendingControls, controlPending{depth: len(l.bracketStack), kind: 'o'})
 			l.gilb.Absolute++
+			l.gilb.Kinds[text]++
 		case "loop":
 			l.pendingControls = append(l.pendingControls, controlPending{depth: len(l.bracketStack), kind: 'o'})
 			l.gilb.Absolute++
+			l.gilb.Kinds["loop"]++
 		case "match":
 			// Сам match в AC не добавляем - складываем число его ветвей
 			// (см. обработку "=>" в Lex), но вложенность считаем как у
@@ -898,10 +906,10 @@ func (l *rustLexer) lexIdentOrMacro() (token, bool) {
 				l.pendingImpl = false
 				return token{Text: "impl-for", Operand: false}, true
 			}
-			// обычный цикл for
 			l.headerDepth = len(l.bracketStack)
 			l.pendingControls = append(l.pendingControls, controlPending{depth: len(l.bracketStack), kind: 'o'})
 			l.gilb.Absolute++
+			l.gilb.Kinds["for"]++
 		case "fn":
 			l.expectName()
 		case "trait":
@@ -1058,4 +1066,25 @@ var rustKeywords = map[string]bool{
 	"final": true, "macro": true, "override": true, "priv": true,
 	"typeof": true, "unsized": true, "virtual": true, "yield": true,
 	"try": true, "union": true,
+}
+
+var referenceOperators = map[string]bool{
+	// арифметические и побитовые (бинарные), они же унарные - и *
+	"+": true, "-": true, "*": true, "/": true, "%": true,
+	"^": true, "&": true, "|": true, "<<": true, ">>": true,
+	// сравнение
+	"==": true, "!=": true, "<": true, ">": true, "<=": true, ">=": true,
+	// логические (ленивые)
+	"&&": true, "||": true,
+	// унарное отрицание
+	"!": true,
+	// присваивание и составное присваивание
+	"=": true, "+=": true, "-=": true, "*=": true, "/=": true, "%=": true,
+	"^=": true, "&=": true, "|=": true, "<<=": true, ">>=": true,
+	// диапазоны
+	"..": true, "..=": true,
+	// оператор "?"
+	"?": true,
+	// приведение типа
+	"as": true,
 }
