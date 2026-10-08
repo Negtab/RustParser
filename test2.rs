@@ -5,6 +5,9 @@ enum Shape {
 
 impl Shape {
     fn area(&self) -> f64 {
+        if 1 < 10 {
+
+        }
         match self {
             Shape::Circle(r) => std::f64::consts::PI * (r * r),
             Shape::Rectangle { width, height } => width * height,
@@ -12,27 +15,50 @@ impl Shape {
     }
 }
 
-// if / else if / else
-fn classify(n: i32) -> &'static str {
-    if n < 0 {
-        "negative"
-    } else if n == 0 {
-        "zero"
-    } else {
-        "positive"
-    }
-}
 
-// match с обычными ветвями и заглушкой "_"
+
+
+
+
+
+
+
+
+
+
+
 fn describe_number(n: i32) -> &'static str {
-    match n {
-        0 => "zero",
-        1 | 2 | 3 => "small",
-        _ => "other",
+    for i in 1..=n {
+        if i < 10 {
+            "hello"
+        }
+        match n {
+
+
+
+            0 => { 
+                if n < 5{
+                    if n < 6 {
+                        if n == 3 {
+
+                        }
+                    }
+                }
+            },
+            1 | 2 | 3 => "small",
+            
+    
+        }
     }
+
+
+
+
+
+
 }
 
-// for
+
 fn sum_range() -> i32 {
     let mut sum = 0;
     for i in 1..=10 {
@@ -41,7 +67,7 @@ fn sum_range() -> i32 {
     sum
 }
 
-// while с break
+
 fn count_down(mut n: i32) -> i32 {
     let mut steps = 0;
     while n > 0 {
@@ -54,7 +80,7 @@ fn count_down(mut n: i32) -> i32 {
     steps
 }
 
-// loop с break и continue
+
 fn find_first_even(items: &[i32]) -> Option<i32> {
     let mut i = 0;
     loop {
@@ -70,7 +96,7 @@ fn find_first_even(items: &[i32]) -> Option<i32> {
     None
 }
 
-// вложенность 4: for -> if -> while -> if
+
 fn deep_check(items: &[i32]) -> i32 {
     let mut total = 0;
     for &x in items.iter() {
@@ -84,6 +110,7 @@ fn deep_check(items: &[i32]) -> i32 {
                 if total > 50 {
                     break;
                 }
+                
             }
         } else {
             loop {
@@ -103,7 +130,9 @@ fn main() {
         println!("area: {:.2}", shape.area());
     }
 
-    println!("{}", classify(-3));
+
+
+
     println!("{}", describe_number(2));
     println!("sum: {}", sum_range());
     println!("steps: {}", count_down(8));

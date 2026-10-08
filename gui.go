@@ -276,6 +276,10 @@ func (g *AppGUI) handleComputeGilb() {
 	}
 
 	m := metrics.Gilb
+	if m.MaxNesting != 0 {
+	  m.MaxNesting--
+	}
+
 	g.lblGilbAbs.SetText(fmt.Sprintf("AC (Абсолютная сложность): %d", m.Absolute))
 	g.lblGilbRel.SetText(fmt.Sprintf("OC (Относительная сложность): %.3f", m.Relative))
 	g.lblGilbCount.SetText(fmt.Sprintf("Количество операторов: %d", m.Count))
