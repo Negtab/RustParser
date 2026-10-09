@@ -22,7 +22,8 @@ type StructuralMetrics struct {
 	Length     float64
 	Volume     float64
 
-	Gilb GilbMetrics
+	Gilb     GilbMetrics
+	Boundary BoundaryMetrics
 }
 
 // GilbMetrics - метрики Джилба: сложность программы через число управляющих
@@ -34,6 +35,15 @@ type GilbMetrics struct {
 	Count      int
 	MaxNesting int            // максимальный уровень вложенности управляющих конструкций
 	Kinds      map[string]int // разбивка AC по видам: if, for, while, loop, match (ветви)
+}
+
+// BoundaryMetrics - метрика граничных значений: абсолютная (Sa) и
+// относительная (So) граничная сложность, посчитанные по упрощённому
+// графу потока управления программы (см. комментарии у cfNode).
+type BoundaryMetrics struct {
+	Absolute float64 // Sa - сумма скорректированных сложностей всех вершин
+	Relative float64 // So = (Sa - 1) / (ν - 1)
+	Vertices int      // ν - общее число вершин графа программы
 }
 
 func AnalyzeRustFile(filePath string) (*StructuralMetrics, error) {
@@ -83,6 +93,8 @@ func AnalyzeRustFile(filePath string) (*StructuralMetrics, error) {
 		res.Gilb.Relative = float64(res.Gilb.Absolute) / (float64(refOps) + float64(res.Gilb.Absolute))
 	}
 
+	res.Boundary = computeBoundary(lexer.cfRoots)
+
 	return res, nil
 }
 
@@ -98,6 +110,93 @@ type token struct {
 type controlPending struct {
 	depth int
 	kind  byte // 'o' - if/while/for/loop, 'm' - match
+}
+
+// --- метрика граничных значений: упрощённый граф потока управления ---
+//
+// Для каждой функции строится граф на уровне управляющих конструкций, а
+// не отдельных машинных инструкций. Прямолинейный участок кода без
+// ветвлений - принимающая вершина (AC=1). if/while/for/match - вершина
+// выбора; её скорректированная сложность = сумма числа вершин в каждой
+// исходящей ветви (пустая ветвь, например "if без else" или "выход из
+// цикла", даёт 0) плюс 1 за общую нижнюю границу (точку, в которой
+// ветви сходятся). Конечная вершина функции имеет сложность 0.
+// loop/break/continue сами по себе не ветвятся (ветвление создаёт
+// только условный break, т.е. вложенный if) и поэтому не порождают
+// отдельной вершины выбора.
+type cfNode struct {
+	kind     byte // 'r' - принимающая, 's' - выбора, 'e' - конечная
+	branches [][]*cfNode
+}
+
+func (n *cfNode) adjustedComplexity() int {
+	switch n.kind {
+	case 'r':
+		return 1
+	case 'e':
+		return 0
+	default: // 's'
+		total := 1 // нижняя граница подграфа (точка схождения ветвей)
+		for _, branch := range n.branches {
+			total += len(branch)
+		}
+		return total
+	}
+}
+
+// cfBlockBuilder накапливает прямолинейный код внутри одной ветви
+// (тело функции, then/else-ветвь if, тело while/for, тело ветви match).
+type cfBlockBuilder struct {
+	nodes       []*cfNode
+	pendingCode bool
+}
+
+func (b *cfBlockBuilder) flush() {
+	if b.pendingCode {
+		b.nodes = append(b.nodes, &cfNode{kind: 'r'})
+		b.pendingCode = false
+	}
+}
+
+// cfSelFrame - открытая вершина выбора if/while/for, ждущая своей
+// (первой, а для циклов - и единственной) ветви.
+type cfSelFrame struct {
+	node     *cfNode
+	ctorKind byte // 'i' - if (может быть else/else-if), 'w' - while/for (вторая ветвь - пустой выход)
+}
+
+// computeBoundary обходит построенные графы всех функций и считает
+// Sa, ν и So.
+func computeBoundary(roots [][]*cfNode) BoundaryMetrics {
+	var all []*cfNode
+	var walk func(block []*cfNode)
+	walk = func(block []*cfNode) {
+		for _, n := range block {
+			all = append(all, n)
+			for _, branch := range n.branches {
+				walk(branch)
+			}
+		}
+	}
+	for _, root := range roots {
+		walk(root)
+	}
+
+	sa := 0
+	for _, n := range all {
+		sa += n.adjustedComplexity()
+	}
+	v := len(all)
+
+	m := BoundaryMetrics{Absolute: float64(sa), Vertices: v}
+	if v > 1 {
+		m.Relative = float64(sa-1) / float64(v-1)
+	}
+	return m
+}
+
+func isSpaceByte(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\r' || c == '\n'
 }
 
 type rustLexer struct {
@@ -127,6 +226,18 @@ type rustLexer struct {
 	// currentNesting: текущая вложенность управляющих конструкций.
 	currentNesting int
 	gilb           GilbMetrics
+
+	// --- метрика граничных значений (boundary value metric) ---
+	pendingFnBody      bool              // между "fn" и открывающей "{" тела функции
+	cfStack            []*cfBlockBuilder // стек строящихся блоков (тело функции / открытая ветвь)
+	cfSelStack         []*cfSelFrame     // стек открытых вершин выбора if/while/for
+	cfMatchStack       []*cfNode         // стек открытых вершин match
+	cfMatchDepth       []int             // глубина cfStack на момент открытия каждого match
+	cfElseIfChain      []*cfNode         // if, ждущие, пока вложенный if (else-if) не присоединится как их else-ветвь
+	cfAwaitingElse     *cfNode           // if, чья then-ветвь закрылась и далее идёт "else {"
+	cfElseBodyFor      []*cfNode         // владельцы открытых блоков "else { ... }"
+	cfAwaitingMatchArm bool              // сразу после "=>" обнаружено "{" - следующий блок это тело ветви match
+	cfRoots            [][]*cfNode       // завершённые графы (по одному на каждую функцию верхнего уровня)
 }
 
 type pendingAnnotation struct {
@@ -147,6 +258,11 @@ type bracketFrame struct {
 	// не impl, не литерала). controlKind хранит, какого именно вида.
 	isControlBody bool
 	controlKind   byte
+
+	// --- метрика граничных значений ---
+	cfFnBody    bool // эта "{" - тело функции (корень графа для Sa/ν)
+	cfElseClose bool // эта "{" - блок "else { ... }" без "if"
+	cfArmClose  bool // эта "{" - тело ветви match, оформленное как блок
 }
 
 func newRustLexer(src []byte) *rustLexer {
@@ -187,6 +303,20 @@ func (l *rustLexer) skipSpacesLookahead() int {
 	return p
 }
 
+// wordAt проверяет, что начиная с позиции p в исходнике стоит слово word
+// целиком (не как префикс более длинного идентификатора).
+func (l *rustLexer) wordAt(p int, word string) bool {
+	if !hasPrefix(l.src[p:], word) {
+		return false
+	}
+	after := p + len(word)
+	if after >= l.n {
+		return true
+	}
+	r, _ := utf8.DecodeRune(l.src[after:])
+	return !isIdentContinue(r)
+}
+
 func (l *rustLexer) curPure() bool {
 	if n := len(l.bracketStack); n > 0 {
 		return l.bracketStack[n-1].pure
@@ -211,6 +341,45 @@ func (l *rustLexer) notePure(t token) {
 		strings.HasSuffix(t.Text, "{}"):
 	default:
 		l.setPure(false)
+	}
+}
+
+// markCfCode отмечает, что в текущем открытом блоке (для метрики
+// граничных значений) появился обычный код - он станет принимающей
+// вершиной при закрытии блока. Токены внутри заголовка конструкции
+// (условие if/while, список match) и паттерны/простые тела ветвей
+// match, ещё не оформленные как отдельный блок, не считаются.
+func (l *rustLexer) markCfCode(t token) {
+	if len(l.cfStack) == 0 {
+		return
+	}
+	if l.headerDepth != -1 {
+		return
+	}
+	if t.Text == "" {
+		return
+	}
+	if n := len(l.cfMatchDepth); n > 0 && len(l.cfStack) == l.cfMatchDepth[n-1] {
+		return
+	}
+	l.cfStack[len(l.cfStack)-1].pendingCode = true
+}
+
+// attachSelNode присоединяет завершённую вершину выбора туда, где её
+// место: если это if, ожидаемый в роли else-ветви предыдущего if
+// (цепочка else-if), то он становится содержимым этой ветви, и тогда уже
+// внешний if считается завершённым и присоединяется тем же путём
+// рекурсивно; иначе узел добавляется в текущий открытый блок.
+func (l *rustLexer) attachSelNode(node *cfNode) {
+	if n := len(l.cfElseIfChain); n > 0 {
+		outer := l.cfElseIfChain[n-1]
+		l.cfElseIfChain = l.cfElseIfChain[:n-1]
+		outer.branches = append(outer.branches, []*cfNode{node})
+		l.attachSelNode(outer)
+		return
+	}
+	if n := len(l.cfStack); n > 0 {
+		l.cfStack[n-1].nodes = append(l.cfStack[n-1].nodes, node)
 	}
 }
 
@@ -396,6 +565,7 @@ func (l *rustLexer) Lex() []token {
 		if len(tokens) > l.seen {
 			for _, t := range tokens[l.seen:] {
 				l.notePure(t)
+				l.markCfCode(t)
 			}
 			l.seen = len(tokens)
 		}
@@ -458,7 +628,10 @@ func (l *rustLexer) Lex() []token {
 		// Открывающая скобка. Для "{" дополнительно проверяем, не тело ли
 		// это ожидающей управляющей конструкции (if/while/for/loop/match) -
 		// тогда увеличиваем текущую вложенность и, для match, запоминаем
-		// глубину, на которой будут лежать его ветви.
+		// глубину, на которой будут лежать его ветви. Параллельно решаем,
+		// что это за "{" с точки зрения графа для метрики граничных
+		// значений: тело функции, ветвь if/while/for, "else {...}" или
+		// тело ветви match, оформленное блоком.
 		if c == '(' || c == '{' || c == '[' {
 			declish := false
 			isControlBody := false
@@ -485,9 +658,34 @@ func (l *rustLexer) Lex() []token {
 					}
 				}
 			}
+
+			cfElseClose := false
+			cfArmClose := false
+			cfFnBody := false
+			if c == '{' {
+				if isControlBody && controlKind == 'o' && len(l.cfSelStack) > 0 {
+					l.cfStack = append(l.cfStack, &cfBlockBuilder{})
+				} else if !isControlBody && l.cfAwaitingElse != nil {
+					l.cfStack = append(l.cfStack, &cfBlockBuilder{})
+					l.cfElseBodyFor = append(l.cfElseBodyFor, l.cfAwaitingElse)
+					l.cfAwaitingElse = nil
+					cfElseClose = true
+				} else if !isControlBody && l.cfAwaitingMatchArm {
+					l.cfStack = append(l.cfStack, &cfBlockBuilder{})
+					l.cfAwaitingMatchArm = false
+					cfArmClose = true
+				}
+				if l.pendingFnBody {
+					l.pendingFnBody = false
+					l.cfStack = append(l.cfStack, &cfBlockBuilder{})
+					cfFnBody = true
+				}
+			}
+
 			l.bracketStack = append(l.bracketStack, bracketFrame{
 				char: c, isDeclBody: declish, pure: c == '{',
 				isControlBody: isControlBody, controlKind: controlKind,
+				cfFnBody: cfFnBody, cfElseClose: cfElseClose, cfArmClose: cfArmClose,
 			})
 			if controlKind == 'm' {
 				l.matchBodyDepths = append(l.matchBodyDepths, len(l.bracketStack))
@@ -497,7 +695,12 @@ func (l *rustLexer) Lex() []token {
 		}
 
 		// Закрывающая скобка. При выходе из тела управляющей конструкции
-		// откатываем вложенность (и, для match, стек глубин его ветвей).
+		// откатываем вложенность (и, для match, стек глубин его ветвей),
+		// а также закрываем соответствующий блок для метрики граничных
+		// значений: тело функции закрывает весь граф этой функции, тело
+		// if/while/for присоединяется как очередная ветвь к своей вершине
+		// выбора, тело match-ветви - как ветвь match, "else {...}" -
+		// как вторая ветвь своего if.
 		if c == ')' || c == '}' || c == ']' {
 			l.pos++
 			if n := len(l.bracketStack); n > 0 {
@@ -509,6 +712,75 @@ func (l *rustLexer) Lex() []token {
 						l.matchBodyDepths = l.matchBodyDepths[:len(l.matchBodyDepths)-1]
 					}
 				}
+
+				switch {
+				case frame.cfFnBody:
+					if n := len(l.cfStack); n > 0 {
+						top := l.cfStack[n-1]
+						top.flush()
+						l.cfStack = l.cfStack[:n-1]
+						nodes := append(top.nodes, &cfNode{kind: 'e'})
+						l.cfRoots = append(l.cfRoots, nodes)
+					}
+				case frame.isControlBody && frame.controlKind == 'o':
+					if n := len(l.cfStack); n > 0 && len(l.cfSelStack) > 0 {
+						top := l.cfStack[n-1]
+						top.flush()
+						l.cfStack = l.cfStack[:n-1]
+						bodyNodes := top.nodes
+
+						sf := l.cfSelStack[len(l.cfSelStack)-1]
+						l.cfSelStack = l.cfSelStack[:len(l.cfSelStack)-1]
+						sf.node.branches = append(sf.node.branches, bodyNodes)
+
+						if sf.ctorKind == 'w' {
+							sf.node.branches = append(sf.node.branches, []*cfNode{})
+							l.attachSelNode(sf.node)
+						} else {
+							p := l.skipSpacesLookahead()
+							if l.wordAt(p, "else") {
+								q := p + 4
+								for q < l.n && isSpaceByte(l.src[q]) {
+									q++
+								}
+								if l.wordAt(q, "if") {
+									l.cfElseIfChain = append(l.cfElseIfChain, sf.node)
+								} else {
+									l.cfAwaitingElse = sf.node
+								}
+							} else {
+								sf.node.branches = append(sf.node.branches, []*cfNode{})
+								l.attachSelNode(sf.node)
+							}
+						}
+					}
+				case frame.controlKind == 'm':
+					if n := len(l.cfMatchStack); n > 0 {
+						mnode := l.cfMatchStack[n-1]
+						l.cfMatchStack = l.cfMatchStack[:n-1]
+						l.cfMatchDepth = l.cfMatchDepth[:len(l.cfMatchDepth)-1]
+						l.attachSelNode(mnode)
+					}
+				case frame.cfElseClose:
+					if n := len(l.cfStack); n > 0 && len(l.cfElseBodyFor) > 0 {
+						top := l.cfStack[n-1]
+						top.flush()
+						l.cfStack = l.cfStack[:n-1]
+						owner := l.cfElseBodyFor[len(l.cfElseBodyFor)-1]
+						l.cfElseBodyFor = l.cfElseBodyFor[:len(l.cfElseBodyFor)-1]
+						owner.branches = append(owner.branches, top.nodes)
+						l.attachSelNode(owner)
+					}
+				case frame.cfArmClose:
+					if n := len(l.cfStack); n > 0 && len(l.cfMatchStack) > 0 {
+						top := l.cfStack[n-1]
+						top.flush()
+						l.cfStack = l.cfStack[:n-1]
+						mnode := l.cfMatchStack[len(l.cfMatchStack)-1]
+						mnode.branches = append(mnode.branches, top.nodes)
+					}
+				}
+
 				if frame.callName != "" {
 					opText := frame.callName + bracketPairText(frame.char)
 					tokens = append(tokens, token{Text: opText, Operand: false})
@@ -556,6 +828,7 @@ func (l *rustLexer) Lex() []token {
 			tokens = append(tokens, tok)
 			l.pendingDeclHeader = false
 			l.pendingImpl = false
+			l.pendingFnBody = false
 			if l.headerDepth == len(l.bracketStack) {
 				l.headerDepth = -1
 			}
@@ -574,11 +847,26 @@ func (l *rustLexer) Lex() []token {
 		case "->":
 			l.skipTypeExpr(typeStop{chars: []byte{'{', ';'}, words: []string{"where"}})
 		case "=>":
+			// Ветвь match: считаем в сложность Джилба, только если "=>"
+			// стоит на глубине ветвей ближайшего открытого match, а не
+			// внутри тела самой ветви, и паттерн не является заглушкой
+			// "_". Для метрики граничных значений, напротив, учитываем
+			// ЛЮБУЮ ветвь, включая "_" - для графа это реальная дуга.
 			tokens = append(tokens, tok)
+			atArmLevel := len(l.matchBodyDepths) > 0 && l.matchBodyDepths[len(l.matchBodyDepths)-1] == len(l.bracketStack)
 			isWildcard := len(tokens) >= 2 && tokens[len(tokens)-2].Text == "_"
-			if n := len(l.matchBodyDepths); n > 0 && l.matchBodyDepths[n-1] == len(l.bracketStack) && !isWildcard {
+			if atArmLevel && !isWildcard {
 				l.gilb.Absolute++
 				l.gilb.Kinds["match"]++
+			}
+			if atArmLevel && len(l.cfMatchStack) > 0 {
+				p := l.skipSpacesLookahead()
+				if p < l.n && l.src[p] == '{' {
+					l.cfAwaitingMatchArm = true
+				} else {
+					mnode := l.cfMatchStack[len(l.cfMatchStack)-1]
+					mnode.branches = append(mnode.branches, []*cfNode{{kind: 'r'}})
+				}
 			}
 		default:
 			tokens = append(tokens, tok)
@@ -880,20 +1168,40 @@ func (l *rustLexer) lexIdentOrMacro() (token, bool) {
 				l.skipGenerics()
 			}
 		case "if", "while":
+			// Обычное ветвление/цикл: сразу считаем в AC и ставим "ожидание
+			// тела" для подсчёта вложенности (Джилб) и для метрики
+			// граничных значений заводим вершину выбора.
 			l.headerDepth = len(l.bracketStack)
 			l.pendingControls = append(l.pendingControls, controlPending{depth: len(l.bracketStack), kind: 'o'})
 			l.gilb.Absolute++
 			l.gilb.Kinds[text]++
+			if n := len(l.cfStack); n > 0 {
+				l.cfStack[n-1].flush()
+				ck := byte('w')
+				if text == "if" {
+					ck = 'i'
+				}
+				l.cfSelStack = append(l.cfSelStack, &cfSelFrame{node: &cfNode{kind: 's'}, ctorKind: ck})
+			}
 		case "loop":
 			l.pendingControls = append(l.pendingControls, controlPending{depth: len(l.bracketStack), kind: 'o'})
 			l.gilb.Absolute++
 			l.gilb.Kinds["loop"]++
+			// Для метрики граничных значений loop сам по себе не ветвится -
+			// ветвление создаёт только условный break (вложенный if),
+			// поэтому отдельную вершину выбора для него не создаём.
 		case "match":
-			// Сам match в AC не добавляем - складываем число его ветвей
-			// (см. обработку "=>" в Lex), но вложенность считаем как у
-			// обычной управляющей конструкции.
+			// Сам match в AC Джилба не добавляем - складываем число его
+			// ветвей (см. обработку "=>"), но вложенность считаем как у
+			// обычной управляющей конструкции. Для графа заводим вершину
+			// выбора match.
 			l.headerDepth = len(l.bracketStack)
 			l.pendingControls = append(l.pendingControls, controlPending{depth: len(l.bracketStack), kind: 'm'})
+			if n := len(l.cfStack); n > 0 {
+				l.cfStack[n-1].flush()
+				l.cfMatchStack = append(l.cfMatchStack, &cfNode{kind: 's'})
+				l.cfMatchDepth = append(l.cfMatchDepth, n)
+			}
 		case "where":
 			l.headerDepth = len(l.bracketStack)
 		case "for":
@@ -906,12 +1214,18 @@ func (l *rustLexer) lexIdentOrMacro() (token, bool) {
 				l.pendingImpl = false
 				return token{Text: "impl-for", Operand: false}, true
 			}
+			// обычный цикл for
 			l.headerDepth = len(l.bracketStack)
 			l.pendingControls = append(l.pendingControls, controlPending{depth: len(l.bracketStack), kind: 'o'})
 			l.gilb.Absolute++
 			l.gilb.Kinds["for"]++
+			if n := len(l.cfStack); n > 0 {
+				l.cfStack[n-1].flush()
+				l.cfSelStack = append(l.cfSelStack, &cfSelFrame{node: &cfNode{kind: 's'}, ctorKind: 'w'})
+			}
 		case "fn":
 			l.expectName()
+			l.pendingFnBody = true
 		case "trait":
 			l.expectName()
 			l.headerDepth = len(l.bracketStack)

@@ -47,12 +47,18 @@ type AppGUI struct {
 	gilbOpRows  []TableRow
 	listGilbOps *widget.List
 
-	// metricsArea переключается между placeholder/halsteadView/gilbView -
-	// одновременно показывается только один из наборов метрик.
+	// Метрика граничных значений
+	lblBoundarySa *widget.Label
+	lblBoundarySo *widget.Label
+	lblBoundaryV  *widget.Label
+
+	// metricsArea переключается между placeholder/halsteadView/gilbView/
+	// boundaryView - одновременно показывается только один из наборов.
 	metricsArea  *fyne.Container
 	placeholder  fyne.CanvasObject
 	halsteadView fyne.CanvasObject
 	gilbView     fyne.CanvasObject
+	boundaryView fyne.CanvasObject
 
 	currentFilePath string
 	metrics         *StructuralMetrics // кэш результата анализа текущего файла
@@ -79,6 +85,7 @@ func (g *AppGUI) initUI() {
 
 	g.buildHalsteadView()
 	g.buildGilbView()
+	g.buildBoundaryView()
 	g.placeholder = widget.NewLabel("Откройте файл и выберите метрику для расчёта.")
 
 	g.metricsArea = container.NewStack(g.placeholder)
@@ -86,9 +93,10 @@ func (g *AppGUI) initUI() {
 	btnOpen := widget.NewButton("Открыть файл", g.handleOpenFile)
 	btnHalstead := widget.NewButton("Посчитать метрики Холстеда", g.handleComputeHalstead)
 	btnGilb := widget.NewButton("Посчитать метрики Джилба", g.handleComputeGilb)
+	btnBoundary := widget.NewButton("Посчитать метрику граничных значений", g.handleComputeBoundary)
 
 	topContainer := container.NewVBox(
-		container.NewHBox(btnOpen, btnHalstead, btnGilb),
+		container.NewHBox(btnOpen, btnHalstead, btnGilb, btnBoundary),
 		g.lblFile,
 	)
 
@@ -100,7 +108,8 @@ func (g *AppGUI) initUI() {
 }
 
 // buildHalsteadView собирает панель с метриками Холстеда и таблицами
-// операторов/операндов. Ничего, относящегося к Джилбу, здесь нет.
+// операторов/операндов. Ничего, относящегося к Джилбу или граничным
+// значениям, здесь нет.
 func (g *AppGUI) buildHalsteadView() {
 	g.lblN1 = widget.NewLabel("η1 (Словарь операторов): -")
 	g.lblN2 = widget.NewLabel("η2 (Словарь операндов): -")
@@ -144,12 +153,9 @@ func (g *AppGUI) buildHalsteadView() {
 	g.halsteadView = container.NewBorder(metricsBox, nil, nil, nil, tablesContainer)
 }
 
-// buildGilbView собирает панель с метриками Джилба. Ничего, относящегося
-// к Холстеду (словари, таблицы), здесь нет.
 // buildGilbView собирает панель с метриками Джилба и списком операторов,
 // учтённых в знаменателе OC (узкий список по Rust Reference). Ничего,
-// относящегося к Холстеду (словари, таблицы операторов/операндов из
-// лексера), здесь нет.
+// относящегося к Холстеду или граничным значениям, здесь нет.
 func (g *AppGUI) buildGilbView() {
 	g.lblGilbAbs = widget.NewLabel("AC (Абсолютная сложность): -")
 	g.lblGilbRel = widget.NewLabel("OC (Относительная сложность): -")
@@ -176,8 +182,21 @@ func (g *AppGUI) buildGilbView() {
 	g.gilbView = container.NewBorder(metricsBox, nil, nil, nil, g.listGilbOps)
 }
 
-// showView переключает правую панель на один из трёх видов; остальные
-// два в этот момент не показываются.
+// buildBoundaryView собирает панель с метрикой граничных значений.
+// Ничего, относящегося к Холстеду или Джилбу, здесь нет.
+func (g *AppGUI) buildBoundaryView() {
+	g.lblBoundarySa = widget.NewLabel("Sa (Абсолютная граничная сложность): -")
+	g.lblBoundarySo = widget.NewLabel("So (Относительная граничная сложность): -")
+	g.lblBoundaryV = widget.NewLabel("ν (Общее число вершин графа): -")
+
+	g.boundaryView = container.NewVBox(
+		widget.NewLabelWithStyle("Метрика граничных значений:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		g.lblBoundarySa, g.lblBoundarySo, g.lblBoundaryV,
+	)
+}
+
+// showView переключает правую панель на один из видов; остальные в этот
+// момент не показываются.
 func (g *AppGUI) showView(view fyne.CanvasObject) {
 	g.metricsArea.Objects = []fyne.CanvasObject{view}
 	g.metricsArea.Refresh()
@@ -217,7 +236,7 @@ func (g *AppGUI) handleOpenFile() {
 }
 
 // ensureMetrics считает метрики для текущего файла один раз и кэширует
-// результат, чтобы обе кнопки могли им пользоваться без повторного анализа.
+// результат, чтобы все кнопки могли им пользоваться без повторного анализа.
 func (g *AppGUI) ensureMetrics() (*StructuralMetrics, bool) {
 	if g.currentFilePath == "" {
 		dialog.ShowInformation("Нет файла", "Сначала откройте Rust файл.", g.window)
@@ -277,7 +296,7 @@ func (g *AppGUI) handleComputeGilb() {
 
 	m := metrics.Gilb
 	if m.MaxNesting != 0 {
-	  m.MaxNesting--
+		m.MaxNesting--
 	}
 
 	g.lblGilbAbs.SetText(fmt.Sprintf("AC (Абсолютная сложность): %d", m.Absolute))
@@ -302,4 +321,19 @@ func (g *AppGUI) handleComputeGilb() {
 	g.listGilbOps.Refresh()
 
 	g.showView(g.gilbView)
+}
+
+// handleComputeBoundary показывает только метрику граничных значений.
+func (g *AppGUI) handleComputeBoundary() {
+	metrics, ok := g.ensureMetrics()
+	if !ok {
+		return
+	}
+
+	m := metrics.Boundary
+	g.lblBoundarySa.SetText(fmt.Sprintf("Sa (Абсолютная граничная сложность): %.0f", m.Absolute))
+	g.lblBoundarySo.SetText(fmt.Sprintf("So (Относительная граничная сложность): %.3f", m.Relative))
+	g.lblBoundaryV.SetText(fmt.Sprintf("ν (Общее число вершин графа): %d", m.Vertices))
+
+	g.showView(g.boundaryView)
 }
